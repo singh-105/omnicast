@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background-color: #0A0A0A;
+    color: #F5F5F7;
+    font-family: 'Inter', system-ui, sans-serif;
+    overflow-x: hidden;
+  }
+
+  ::selection {
+    background-color: #FF2D95;
+    color: #FFFFFF;
+  }
+}
+
+/* Custom Futuristic Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0A0A0A;
+}
+::-webkit-scrollbar-thumb {
+  background: #262630;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #007BA7;
+}
+
+/* Glow Utilities */
+.text-glow-blue {
+  text-shadow: 0 0 20px rgba(0, 194, 255, 0.6), 0 0 40px rgba(0, 123, 167, 0.4);
+}
+
+.text-glow-rose {
+  text-shadow: 0 0 20px rgba(255, 45, 149, 0.6), 0 0 40px rgba(255, 45, 149, 0.3);
+}
+
+.box-glow-blue {
+  box-shadow: 0 0 30px -5px rgba(0, 123, 167, 0.35);
+}
+
+.box-glow-rose {
+  box-shadow: 0 0 30px -5px rgba(255, 45, 149, 0.35);
+}
+
+.hero-vignette {
+  mask-image: radial-gradient(circle at center, black 40%, transparent 80%);
+  -webkit-mask-image: radial-gradient(circle at 60% 45%, black 45%, transparent 85%);
+}
+
+@keyframes pulse-slow {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.65; transform: scale(1.03); }
+}
+
+.animate-pulse-slow {
+  animation: pulse-slow 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}

@@ -1,0 +1,44 @@
+{
+  "name": "omnicast",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"vite --host\" \"node relay.js\"",
+    "build": "vite build",
+    "serve": "vite preview",
+    "test": "node --test tests/**/*.test.js",
+    "test:e2e": "node tests/e2e_broadcast.js && node tests/e2e_cascade.js",
+    "test:visual": "node tests/e2e_visual.js"
+  },
+  "dependencies": {
+    "@chainsafe/libp2p-gossipsub": "^14.1.2",
+    "@chainsafe/libp2p-noise": "^17.0.0",
+    "@chainsafe/libp2p-yamux": "^8.0.1",
+    "@libp2p/bootstrap": "^12.0.29",
+    "@libp2p/circuit-relay-v2": "^4.2.11",
+    "@libp2p/identify": "^4.1.12",
+    "@libp2p/pubsub-peer-discovery": "^12.0.0",
+    "@libp2p/webrtc": "^6.0.29",
+    "@libp2p/websockets": "^10.1.19",
+    "@vitejs/plugin-react": "^4.2.1",
+    "concurrently": "^8.2.2",
+    "firebase": "^12.17.1",
+    "it-pipe": "^3.0.1",
+    "libp2p": "^3.3.8",
+    "lucide-react": "^1.31.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tailwindcss": "^3.4.19",
+    "uint8arrays": "^6.1.1",
+    "vite": "^5.1.0",
+    "vite-plugin-node-polyfills": "^0.28.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-basic-ssl": "^1.1.0",
+    "autoprefixer": "^10.5.4",
+    "playwright": "^1.58.2",
+    "postcss": "^8.5.26"
+  }
+}

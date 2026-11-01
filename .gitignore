@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+
+# Production build output
+dist/
+dist-ssr/
+
+# Git backups
+.git_*/
+.git_ather_backup/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+relay-key*.json
+
+# Agent, internal instructions and documentation
+.agents/
+AGENTS.md
+CLAUDE.md
+gravity/
+
+# Legacy root scratch & unused scripts
+*.bak
+patch.js
+start.sh
+test-dial.js
+test-discovery*.js
+test-puppeteer.js
+test-render.js
+test-vite-resolve.js
+
+# Legacy unused utilities
+src/firebase.js
+src/utils/
+
+# Test screenshots & visual artifacts
+tests/screenshots/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.vercel/

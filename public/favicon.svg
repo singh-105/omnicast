@@ -1,0 +1,17 @@
+<svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="omni-blue" x1="4" y1="4" x2="36" y2="44" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#00C2FF" />
+      <stop offset="100%" stopColor="#007BA7" />
+    </linearGradient>
+    <linearGradient id="omni-rose" x1="44" y1="4" x2="12" y2="44" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#FF5CA8" />
+      <stop offset="100%" stopColor="#FF2D95" />
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="12" fill="#0A0A0A" />
+  <path d="M24 8C15.163 8 8 15.163 8 24C8 28.784 10.105 33.077 13.464 36L17.146 32.317C14.818 30.209 13.333 27.278 13.333 24C13.333 18.109 18.109 13.333 24 13.333C27.278 13.333 30.209 14.818 32.317 17.146L36 13.464C33.077 10.105 28.784 8 24 8Z" fill="url(#omni-blue)" />
+  <path d="M24 40C32.837 40 40 32.837 40 24C40 19.216 37.895 14.923 34.536 12L30.854 15.683C33.182 17.791 34.667 20.722 34.667 24C34.667 29.891 29.891 34.667 24 34.667C20.722 34.667 17.791 33.182 15.683 30.854L12 34.536C14.923 37.895 19.216 40 24 40Z" fill="url(#omni-rose)" />
+  <circle cx="24" cy="24" r="4.5" fill="#F5F5F7" />
+  <circle cx="24" cy="24" r="2" fill="#0A0A0A" />
+</svg>
