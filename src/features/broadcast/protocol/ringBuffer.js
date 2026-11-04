@@ -53,12 +53,12 @@ export class MediaRingBuffer {
 
     if (chunk.isKeyframe) {
       this.latestKeyframeSeq = chunk.sequence;
-      // Always retain the freshest keyframe as recovery anchor so late-joining
-      // viewers or recovering peers bootstrap from near the live edge.
-      this.bootstrapKeyframe = {
-        ...chunk,
-        payload: chunk.payload instanceof Uint8Array ? chunk.payload.slice() : chunk.payload,
-      };
+      if (!this.bootstrapKeyframe) {
+        this.bootstrapKeyframe = {
+          ...chunk,
+          payload: chunk.payload instanceof Uint8Array ? chunk.payload.slice() : chunk.payload,
+        };
+      }
     }
 
     this.buffer.set(chunk.sequence, {
@@ -103,17 +103,10 @@ export class MediaRingBuffer {
   }
 
   /**
-   * FIX-A: Returns chunks from the most recent keyframe up to the newest sequence,
-   * but hard-capped at MAX_BOOTSTRAP_BYTES total payload size.
-   *
-   * With ring buffer now 20 items / 6s, this rarely exceeds ~600KB.
-   * But if the ring buffer was misconfigured or items are large, this cap prevents
-   * a bootstrap burst that overflows the DataChannel pending queue.
+   * Returns all chunks starting from the most recent keyframe up to the newest sequence.
+   * Enables immediate, stall-free playback synchronization for late-joining children.
    */
   getSinceLatestKeyframe() {
-    // FIX-A: Hard byte cap on total bootstrap payload (init segment is sent separately)
-    const MAX_BOOTSTRAP_BYTES = 512 * 1024; // 512 KB
-
     const all = this.getAll();
     if (all.length === 0) return [];
 
@@ -125,34 +118,18 @@ export class MediaRingBuffer {
       }
     }
 
-    let candidates;
     if (keyframeIndex === -1) {
       if (!this.bootstrapKeyframe) return [];
 
       // The anchor may have been evicted from the bounded map. Re-send it
       // followed by the retained tail so a child can recover without waiting
       // for a future keyframe.
-      candidates = [
+      return [
         this.bootstrapKeyframe,
         ...all.filter((chunk) => chunk.sequence > this.bootstrapKeyframe.sequence),
       ];
-    } else {
-      candidates = all.slice(keyframeIndex);
     }
-
-    // FIX-A: Enforce byte cap — always include at least the keyframe itself,
-    // then add delta chunks until cap is reached.
-    let totalBytes = 0;
-    const result = [];
-    for (const chunk of candidates) {
-      const chunkBytes = chunk.payload ? chunk.payload.byteLength : 0;
-      if (result.length > 0 && totalBytes + chunkBytes > MAX_BOOTSTRAP_BYTES) {
-        break; // Enough data for decoder bootstrap
-      }
-      result.push(chunk);
-      totalBytes += chunkBytes;
-    }
-    return result;
+    return all.slice(keyframeIndex);
   }
 
   /**
@@ -179,26 +156,16 @@ export class MediaRingBuffer {
   prune() {
     const now = Date.now();
 
-    // FIX-A (prune): Recompute latestKeyframeSeq BEFORE eviction.
-    // Commit f5865e1 moved this AFTER eviction which allowed the keyframe to be
-    // silently evicted and left latestKeyframeSeq=-1, breaking child bootstrap.
-    // We now compute it first so getSinceLatestKeyframe() can find it even if
-    // the keyframe itself is evicted (bootstrapKeyframe anchor handles recovery).
-    this.latestKeyframeSeq = -1;
-    for (const chunk of this.buffer.values()) {
-      if (chunk.isKeyframe && chunk.sequence > this.latestKeyframeSeq) {
-        this.latestKeyframeSeq = chunk.sequence;
-      }
-    }
-
-    // 1. Evict by age (unconditional — bootstrapKeyframe anchor is the safety net).
+    // 1. Evict by age. The ring is deliberately bounded even when a browser
+    // does not expose a detectable keyframe for a long GOP.
     for (const [seq, chunk] of this.buffer) {
       if (now - chunk.bufferedAt > this.maxDurationMs) {
         this.buffer.delete(seq);
       }
     }
 
-    // 2. Enforce the hard item bound (oldest-first eviction).
+    // 2. Enforce the hard item bound. A stale keyframe is less harmful than
+    // unbounded memory growth and increasing GC pauses during a live stream.
     if (this.buffer.size > this.maxItems) {
       const sortedKeys = Array.from(this.buffer.keys()).sort((a, b) => a - b);
       for (const seq of sortedKeys) {
@@ -207,7 +174,8 @@ export class MediaRingBuffer {
       }
     }
 
-    // Recompute after eviction so callers see the accurate in-buffer state.
+    // Recompute this after eviction so getSinceLatestKeyframe never points at
+    // a chunk that has already left the bounded ring.
     this.latestKeyframeSeq = -1;
     for (const chunk of this.buffer.values()) {
       if (chunk.isKeyframe && chunk.sequence > this.latestKeyframeSeq) {

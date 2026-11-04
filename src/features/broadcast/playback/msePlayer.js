@@ -76,14 +76,6 @@ export class MsePlayer {
       this.isSourceOpen = true;
 
       try {
-        // Guard against duplicate addSourceBuffer if sourceopen fires more than once
-        if (this.sourceBuffer || (this.mediaSource.sourceBuffers && this.mediaSource.sourceBuffers.length > 0)) {
-          if (!this.sourceBuffer) {
-            this.sourceBuffer = this.mediaSource.sourceBuffers[0];
-          }
-          this.processAppendQueue();
-          return;
-        }
         this.sourceBuffer = this.mediaSource.addSourceBuffer(this.mimeType);
         this.sourceBuffer.mode = 'segments';
 
@@ -133,37 +125,12 @@ export class MsePlayer {
    * @param {boolean} isInit
    * @param {boolean} isKeyframe
    */
-  /**
-   * FIX-E (MSE): Append a media chunk to the SourceBuffer.
-   * appendQueue entries are tagged with enqueue time and evicted if >3s old
-   * to prevent stale data causing decoder errors under congestion.
-   */
   appendChunk(chunkBytes, isInit = false, isKeyframe = false) {
     if (this.isDestroyed) return;
 
     const buffer = chunkBytes instanceof Uint8Array
       ? chunkBytes.buffer.slice(chunkBytes.byteOffset, chunkBytes.byteOffset + chunkBytes.byteLength)
       : chunkBytes;
-
-    // FIX-E: Evict stale non-init entries from appendQueue before adding more.
-    // If transport was congested and queued media is >3s old, the timestamps will
-    // be wrong and the decoder will error on out-of-order presentation times.
-    const MAX_APPEND_QUEUE_AGE_MS = 3000;
-    if (!isInit && this.appendQueue.length > 0) {
-      const now = Date.now();
-      let staleCount = 0;
-      this.appendQueue = this.appendQueue.filter(item => {
-        // Keep init headers, special objects without timestamps, and recent items
-        if (item && (item.isInitHeader || !item._queuedAt)) return true;
-        if (now - item._queuedAt < MAX_APPEND_QUEUE_AGE_MS) return true;
-        staleCount++;
-        return false;
-      });
-      if (staleCount > 0) {
-        console.warn(`[MSE] Evicted ${staleCount} stale appendQueue entries (>3s old). Will wait for keyframe.`);
-        this.waitingForKeyframe = true; // Need clean keyframe after dropping stale data
-      }
-    }
 
     if (isInit) {
       if (!this.hasInitSegment) {
@@ -209,10 +176,7 @@ export class MsePlayer {
       this.waitingForKeyframe = false;
     }
 
-    // Tag with enqueue time for future age-based eviction
-    const taggedBuffer = buffer;
-    taggedBuffer._queuedAt = Date.now();
-    this.appendQueue.push(taggedBuffer);
+    this.appendQueue.push(buffer);
     this.processAppendQueue();
   }
 
@@ -223,8 +187,7 @@ export class MsePlayer {
       !this.sourceBuffer ||
       this.sourceBuffer.updating ||
       this.isAppending ||
-      this.appendQueue.length === 0 ||
-      (this.videoElement && this.videoElement.error)
+      this.appendQueue.length === 0
     ) {
       return;
     }
@@ -278,12 +241,8 @@ export class MsePlayer {
         this.pruneBuffer(true);
         this.appendQueue.unshift(nextBuffer);
         setTimeout(() => this.processAppendQueue(), 0);
-      } else {
-        // Fatal or invalid state: clear appendQueue to prevent infinite append retry loop
-        this.appendQueue = [];
-        if (this.onError) {
-          this.onError(err);
-        }
+      } else if (this.onError) {
+        this.onError(err);
       }
     }
   }
