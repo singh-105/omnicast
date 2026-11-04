@@ -136,9 +136,6 @@ export async function createCanonicalEnvelope({
 export async function signChunk(privateKey, chunkData) {
   const subtle = getCryptoSubtle();
   const canonicalBytes = await createCanonicalEnvelope(chunkData);
-  const envelopeStr = new TextDecoder().decode(canonicalBytes);
-  console.log(`[Crypto-Sign] seq=${chunkData.sequence}: "${envelopeStr}"`);
-
   const signatureBuffer = await subtle.sign(
     {
       name: 'ECDSA',

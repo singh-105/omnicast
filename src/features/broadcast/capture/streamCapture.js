@@ -25,12 +25,16 @@ export const SUPPORTED_MIME_TYPES = [
 /**
  * Returns the best supported MIME type for live encoding and MSE playback.
  */
-export function getSupportedMimeType() {
+export function getSupportedMimeType({ hasAudio = true } = {}) {
   if (typeof window === 'undefined' || typeof MediaRecorder === 'undefined') {
-    return 'video/webm; codecs="vp8,opus"';
+    return hasAudio ? 'video/webm; codecs="vp8,opus"' : 'video/webm; codecs="vp8"';
   }
 
-  for (const mime of SUPPORTED_MIME_TYPES) {
+  const mimeTypes = hasAudio
+    ? SUPPORTED_MIME_TYPES
+    : SUPPORTED_MIME_TYPES.filter((mime) => !mime.includes('opus') && !mime.includes('mp4a'));
+
+  for (const mime of mimeTypes) {
     if (MediaRecorder.isTypeSupported(mime)) {
       return mime;
     }
@@ -56,6 +60,14 @@ export class StreamCapture {
     this.timesliceMs = 300; // ~300ms chunks: cuts chunk delivery latency from 500ms
     this.currentSourceType = 'camera'; // 'camera' | 'screen'
     this.stashedFirstChunk = null;
+    this.isSwitchingSource = false;
+    this.isRecoveringCamera = false;
+    this.cameraRecoveryTimer = null;
+    this.trackGeneration = 0;
+    this.fallbackAnimationId = null;
+    this.fallbackDrawTimer = null;
+    this.fallbackCanvas = null;
+    this.recorderGeneration = 0;
   }
 
   /**
@@ -94,10 +106,16 @@ export class StreamCapture {
           video: Boolean(video),
           audio: audio ? { echoCancellation: true } : false,
         });
+      } else if (err.name === 'NotFoundError' || err.name === 'NotReadableError' || err.name === 'AbortError') {
+        const fallbackStream = this.createFallbackStream();
+        if (!fallbackStream) throw err;
+        console.warn('[StreamCapture] Camera unavailable; starting with a standby video frame');
+        stream = fallbackStream;
       } else {
         throw err;
       }
     }
+    this.mediaStream = stream;
     this.attachTrackListeners(stream, 'camera');
     this.currentSourceType = 'camera';
     return this.initRecorder(stream);
@@ -154,6 +172,7 @@ export class StreamCapture {
       }
     }
 
+    this.mediaStream = finalStream;
     this.attachTrackListeners(finalStream, 'screen');
     this.currentSourceType = 'screen';
     return this.initRecorder(finalStream);
@@ -164,10 +183,13 @@ export class StreamCapture {
    */
   attachTrackListeners(stream, sourceType) {
     const videoTrack = stream.getVideoTracks()[0];
+    const generation = ++this.trackGeneration;
     if (videoTrack) {
       videoTrack.addEventListener('ended', async () => {
-        if (this.isSwitchingSource) return;
-        console.log(`[Capture] Video track for ${sourceType} ended`);
+        // A replaced stream can emit `ended` asynchronously after its tracks
+        // were deliberately stopped. Only recover the currently active stream.
+        if (this.isSwitchingSource || stream !== this.mediaStream || generation !== this.trackGeneration) return;
+        console.warn(`[Capture] ${sourceType} video input became unavailable; attempting recovery`);
         if (sourceType === 'screen') {
           // Native browser "Stop sharing" clicked -> cleanly revert to camera
           console.log('[Capture] Reverting to camera after screen share stopped...');
@@ -179,6 +201,8 @@ export class StreamCapture {
           } catch (err) {
             console.error('[Capture] Failed to revert to camera:', err);
           }
+        } else {
+          await this.recoverCamera();
         }
       });
 
@@ -190,6 +214,130 @@ export class StreamCapture {
         console.log(`[Capture] ${sourceType} video track unmuted`);
       });
     }
+  }
+
+  /**
+   * Recover a camera that disappeared without ending the broadcast. This is
+   * common with laptop camera power management and also makes headless fake
+   * capture devices restart cleanly instead of leaving MediaRecorder alive
+   * with no video chunks.
+   */
+  async recoverCamera() {
+    if (this.isRecoveringCamera || !this.isRecording || this.currentSourceType !== 'camera') return;
+
+    this.isRecoveringCamera = true;
+    try {
+      let lastError = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const newStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 1280, max: 1280 },
+              height: { ideal: 720, max: 720 },
+              frameRate: { ideal: 30, max: 30 },
+            },
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+
+          this.replaceActiveStream(newStream, this.sequence > 0);
+          this.isSwitchingSource = false;
+          console.log('[Capture] Camera recovered; continuing the active broadcast');
+          return;
+        } catch (err) {
+          lastError = err;
+          await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        }
+      }
+
+      // Keep the broadcast alive with a visible animated standby frame when
+      // the browser cannot reacquire a camera (for example a disconnected USB
+      // camera or a headless test device). Audio is preserved when available.
+      const fallbackStream = this.createFallbackStream();
+      if (fallbackStream) {
+        this.replaceActiveStream(fallbackStream, this.sequence > 0);
+        console.warn('[Capture] Camera unavailable; broadcasting a standby video frame until it returns');
+      } else if (lastError && this.onError) {
+        this.onError(lastError);
+      }
+    } finally {
+      this.isSwitchingSource = false;
+      this.isRecoveringCamera = false;
+    }
+  }
+
+  replaceActiveStream(newStream, isSourceSwitch = true) {
+    this.isSwitchingSource = true;
+    if (this.mediaRecorder) {
+      this.mediaRecorder.ondataavailable = null;
+      this.mediaRecorder.onerror = null;
+      this.mediaRecorder.onstop = null;
+      if (this.mediaRecorder.state !== 'inactive') {
+        try { this.mediaRecorder.stop(); } catch (_) {}
+      }
+    }
+    if (this.mediaStream) {
+      this.mediaStream.getTracks().forEach((track) => {
+        try { track.stop(); } catch (_) {}
+      });
+    }
+
+    this.mediaStream = newStream;
+    this.stashedFirstChunk = null;
+    this.attachTrackListeners(newStream, 'camera');
+    this.initRecorder(newStream, isSourceSwitch);
+    this.isSwitchingSource = false;
+  }
+
+  createFallbackStream() {
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') return null;
+    if (typeof HTMLCanvasElement === 'undefined' || !HTMLCanvasElement.prototype.captureStream) return null;
+
+    this.stopFallbackAnimation();
+    const canvas = document.createElement('canvas');
+    canvas.width = 1280;
+    canvas.height = 720;
+    const context = canvas.getContext('2d');
+    if (!context) return null;
+
+    // Keep the standby image simple. A tiny changing marker makes every
+    // captureStream tick observable without a full-canvas animation loop.
+    context.fillStyle = '#090b12';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = '#16b8f3';
+    context.font = 'bold 38px sans-serif';
+    context.fillText('OMNICAST', 72, 92);
+    context.fillStyle = '#a1a1aa';
+    context.font = '24px sans-serif';
+    context.fillText('Camera reconnecting…', 72, 145);
+    this.fallbackCanvas = canvas;
+    let marker = false;
+    this.fallbackDrawTimer = setInterval(() => {
+      marker = !marker;
+      context.fillStyle = marker ? '#16b8f3' : '#0b6d91';
+      context.fillRect(canvas.width - 120, 72, 24, 24);
+    }, 1000 / 30);
+
+    const videoTrack = canvas.captureStream(30).getVideoTracks()[0];
+    const audioTracks = this.mediaStream
+      ? this.mediaStream.getAudioTracks().filter((track) => track.readyState === 'live').map((track) => track.clone())
+      : [];
+    return new MediaStream([videoTrack, ...audioTracks]);
+  }
+
+  stopFallbackAnimation() {
+    if (this.fallbackAnimationId !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(this.fallbackAnimationId);
+    }
+    this.fallbackAnimationId = null;
+    if (this.fallbackDrawTimer !== null) {
+      clearInterval(this.fallbackDrawTimer);
+      this.fallbackDrawTimer = null;
+    }
+    this.fallbackCanvas = null;
   }
 
   /**
@@ -297,12 +445,13 @@ export class StreamCapture {
    */
   initRecorder(stream, isSourceSwitch = false) {
     this.mediaStream = stream;
+    const recorderGeneration = ++this.recorderGeneration;
     if (!isSourceSwitch) {
       this.sequence = 0;
       this.initSegment = null;
     }
 
-    this.mimeType = getSupportedMimeType();
+    this.mimeType = getSupportedMimeType({ hasAudio: stream.getAudioTracks().length > 0 });
     if (!this.mimeType) {
       throw new Error('No compatible video/audio encoding format found for this browser');
     }
@@ -323,6 +472,10 @@ export class StreamCapture {
     this.isSecondChunkOfNewSource = isSourceSwitch;
 
     this.mediaRecorder.ondataavailable = async (event) => {
+      // A pending Blob.arrayBuffer() from a recorder that was replaced can
+      // resolve after the new recorder starts. Never mix those old clusters
+      // into the new container epoch.
+      if (recorderGeneration !== this.recorderGeneration) return;
       if (!event.data || event.data.size === 0) return;
 
       try {
@@ -412,15 +565,10 @@ export class StreamCapture {
   probeKeyframe(bytes) {
     if (!bytes || bytes.length < 16) return false;
 
-    // Scan for VP8 keyframe start code (0x9D 0x01 0x2A preceded by frame_type bit 0 == 0)
-    for (let i = 1; i < Math.min(bytes.length - 3, 2048); i++) {
-      if (bytes[i] === 0x9d && bytes[i + 1] === 0x01 && bytes[i + 2] === 0x2a) {
-        if ((bytes[i - 1] & 0x01) === 0) {
-          return true;
-        }
-      }
-    }
-
+    // Timeslice blobs are not guaranteed to begin at an EBML cluster
+    // boundary. The first media chunk of each recorder epoch is marked
+    // explicitly above; uncertain later blobs stay delta frames so bootstrap
+    // never starts from a false keyframe inside compressed data.
     return false;
   }
 
@@ -437,6 +585,12 @@ export class StreamCapture {
   }
 
   stop() {
+    if (this.cameraRecoveryTimer) {
+      clearTimeout(this.cameraRecoveryTimer);
+      this.cameraRecoveryTimer = null;
+    }
+    this.isRecoveringCamera = false;
+    this.stopFallbackAnimation();
     if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
       try {
         this.mediaRecorder.stop();

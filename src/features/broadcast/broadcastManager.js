@@ -69,9 +69,17 @@ export class BroadcastManager {
     // Media & Playback
     this.streamCapture = null;
     this.msePlayer = null;
-    this.ringBuffer = new MediaRingBuffer({ maxItems: 25, maxDurationMs: 5000 });
+    this.streamMimeType = 'video/webm; codecs="vp8,opus"';
+    this.ringBuffer = new MediaRingBuffer({ maxItems: 240, maxDurationMs: 60000 });
     this.reorderQueue = null;
     this.reassembler = new PacketReassembler();
+    this.originChunkQueue = [];
+    this.isProcessingOriginChunks = false;
+    this.incomingPacketQueue = [];
+    this.isProcessingIncomingPackets = false;
+    this.upstreamWatchdogTimer = null;
+    this.lastPacketAt = 0;
+    this.bootstrapRetryCount = 0;
 
     // Telemetry & Stats
     this.metrics = {
@@ -127,10 +135,7 @@ export class BroadcastManager {
         this.ws.send(JSON.stringify({
           type: 'announce',
           peerId: this.localPeerId,
-          capabilities: {
-            isMobile: this.isMobileDevice(),
-            userRelayPermitted: true,
-          },
+          capabilities: this.getPeerCapabilities(),
         }));
 
         // Flush any messages queued before WebSocket finished opening
@@ -177,6 +182,14 @@ export class BroadcastManager {
   isMobileDevice() {
     if (typeof navigator === 'undefined') return false;
     return /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+  }
+
+  getPeerCapabilities() {
+    const isMobile = this.isMobileDevice();
+    return {
+      isMobile,
+      userRelayPermitted: !isMobile,
+    };
   }
 
   // ──────────────────────────────────────────────────────────
@@ -256,7 +269,26 @@ export class BroadcastManager {
   /**
    * Origin Chunk Handler: Sign once, fragment, and distribute over RTCDataChannels.
    */
-  async handleOriginChunk(chunk) {
+  handleOriginChunk(chunk) {
+    if (this.role !== 'broadcaster' || !chunk) return;
+    this.originChunkQueue.push(chunk);
+    void this.processOriginChunkQueue();
+  }
+
+  async processOriginChunkQueue() {
+    if (this.isProcessingOriginChunks) return;
+    this.isProcessingOriginChunks = true;
+    try {
+      while (this.role === 'broadcaster' && this.originChunkQueue.length > 0) {
+        const chunk = this.originChunkQueue.shift();
+        await this.processOriginChunk(chunk);
+      }
+    } finally {
+      this.isProcessingOriginChunks = false;
+    }
+  }
+
+  async processOriginChunk(chunk) {
     if (this.role !== 'broadcaster') return;
 
     this.metrics.chunksEmitted++;
@@ -336,10 +368,7 @@ export class BroadcastManager {
     this.sendWs({
       type: 'broadcast:join',
       broadcastId,
-      capabilities: {
-        isMobile: this.isMobileDevice(),
-        userRelayPermitted: true,
-      },
+      capabilities: this.getPeerCapabilities(),
     });
 
     this.videoElement = videoElement;
@@ -355,6 +384,7 @@ export class BroadcastManager {
     this.metrics.tier = tier;
     this.metrics.parentPeerId = parentPeerId;
     this.standbyCandidateIds = standbyParents || [];
+    this.streamMimeType = mimeType || this.streamMimeType;
 
     // Import origin public key for verifying media authenticity
     if (originPubKey && !this.originPublicKey) {
@@ -369,24 +399,14 @@ export class BroadcastManager {
     }
 
     // Initialize MSE Player with the broadcast's codec format
-    if (this.videoElement && !this.msePlayer) {
-      this.msePlayer = new MsePlayer({
-        videoElement: this.videoElement,
-        mimeType: mimeType || 'video/webm; codecs="vp8,opus"',
-        onError: (err) => this.onError && this.onError(err),
-        onLiveStateChange: (state) => {
-          if (this.onLiveStateChange) {
-            this.onLiveStateChange(state);
-          }
-        },
-      });
-    }
+    this.createMsePlayer();
 
     // Connect to active upstream parent via WebRTC DataChannel
     this.connectToParent(parentPeerId);
 
     // Warm up standby connections if candidates available
     this.prepareStandbys();
+    this.startUpstreamWatchdog();
 
     this.updateState('streaming');
   }
@@ -442,10 +462,75 @@ export class BroadcastManager {
     }
   }
 
+  startUpstreamWatchdog() {
+    if (this.upstreamWatchdogTimer) clearInterval(this.upstreamWatchdogTimer);
+    this.lastPacketAt = Date.now();
+    this.bootstrapRetryCount = 0;
+
+    this.upstreamWatchdogTimer = setInterval(() => {
+      if (this.role !== 'viewer' || !this.broadcastId) return;
+      if (!this.parentLink || !this.parentLink.isOpen()) return;
+      if (Date.now() - this.lastPacketAt < 6000) return;
+
+      this.bootstrapRetryCount++;
+      this.parentLink.sendControl({ type: 'bootstrap-req' });
+      this.updateState('reconnecting');
+
+      if (this.bootstrapRetryCount >= 3) {
+        const parentPeerId = this.parentLink.remotePeerId;
+        this.bootstrapRetryCount = 0;
+        this.lastPacketAt = Date.now();
+        this.connectToParent(parentPeerId);
+      }
+    }, 3000);
+  }
+
   /**
    * Handle incoming binary packet on RTCDataChannel.
    */
-  async handleIncomingBinary(arrayBuffer) {
+  handleIncomingBinary(arrayBuffer) {
+    if (!(arrayBuffer instanceof ArrayBuffer)) return;
+    this.lastPacketAt = Date.now();
+    this.incomingPacketQueue.push(arrayBuffer);
+    void this.processIncomingPacketQueue();
+  }
+
+  createMsePlayer() {
+    if (!this.videoElement || this.msePlayer) return;
+    this.msePlayer = new MsePlayer({
+      videoElement: this.videoElement,
+      mimeType: this.streamMimeType,
+      onError: (err) => this.onError && this.onError(err),
+      onLiveStateChange: (state) => {
+        if (this.onLiveStateChange) this.onLiveStateChange(state);
+      },
+    });
+  }
+
+  resetPlaybackForResync() {
+    if (this.msePlayer) {
+      this.msePlayer.destroy();
+      this.msePlayer = null;
+    }
+    this.reassembler.clear();
+    if (this.reorderQueue) this.reorderQueue.reset();
+    this.createMsePlayer();
+  }
+
+  async processIncomingPacketQueue() {
+    if (this.isProcessingIncomingPackets) return;
+    this.isProcessingIncomingPackets = true;
+    try {
+      while (this.incomingPacketQueue.length > 0) {
+        const packetBuffer = this.incomingPacketQueue.shift();
+        await this.processIncomingBinary(packetBuffer);
+      }
+    } finally {
+      this.isProcessingIncomingPackets = false;
+    }
+  }
+
+  async processIncomingBinary(arrayBuffer) {
     this.metrics.bytesReceived += arrayBuffer.byteLength;
 
     try {
@@ -492,6 +577,12 @@ export class BroadcastManager {
       // Push to reorder queue for local playback
       if (completeChunk.type === PacketType.INIT_SEGMENT) {
         // Init segment bypasses sequence queue and feeds directly to MSE
+        // It still consumes a logical sequence number. Reset the media queue
+        // to the first chunk of this new container epoch so a source switch
+        // is not misreported as a lost media packet.
+        if (this.reorderQueue) {
+          this.reorderQueue.reset(completeChunk.sequence + 1);
+        }
         this.renderChunk(completeChunk);
       } else if (this.reorderQueue) {
         this.reorderQueue.push(completeChunk);
@@ -614,7 +705,7 @@ export class BroadcastManager {
     const recentChunks = this.ringBuffer.getSinceLatestKeyframe();
 
     // If init segment or keyframe is not ready yet, wait until one is available
-    if (!initSeg || recentChunks.length === 0) {
+    if (!initSeg || recentChunks.length === 0 || !recentChunks.some((chunk) => chunk.isKeyframe)) {
       return; // Do NOT set _hasSynced = true yet! Will sync when first keyframe is added.
     }
 
@@ -654,6 +745,15 @@ export class BroadcastManager {
   }
 
   handleChildControlMessage(childPeerId, msg) {
+    if (msg.type === 'bootstrap-req') {
+      const childLink = this.children.get(childPeerId);
+      if (childLink) {
+        childLink._hasSynced = false;
+        this.syncChildWithStream(childLink);
+      }
+      return;
+    }
+
     if (msg.type === 'retransmit-req') {
       const { fromSeq, toSeq } = msg;
       const childLink = this.children.get(childPeerId);
@@ -685,6 +785,7 @@ export class BroadcastManager {
   async triggerFailover() {
     const startTime = performance.now();
     this.metrics.failovers++;
+    this.resetPlaybackForResync();
 
     if (this.standbyCandidateIds.length > 0) {
       const promotedStandby = this.standbyCandidateIds[0];
@@ -707,10 +808,7 @@ export class BroadcastManager {
       this.sendWs({
         type: 'broadcast:join',
         broadcastId: this.broadcastId,
-        capabilities: {
-          isMobile: this.isMobileDevice(),
-          userRelayPermitted: true,
-        },
+        capabilities: this.getPeerCapabilities(),
       });
     }
   }
@@ -747,7 +845,12 @@ export class BroadcastManager {
         console.log(`🔄 Upstream parent departed, reparenting to ${msg.newParentPeerId.slice(-8)}`);
         this.metrics.parentPeerId = msg.newParentPeerId;
         this.standbyCandidateIds = msg.standbyParents || [];
-        this.connectToParent(msg.newParentPeerId);
+        this.resetPlaybackForResync();
+        this.handleTopologyAssigned({
+          ...msg,
+          parentPeerId: msg.newParentPeerId,
+          mimeType: this.streamMimeType,
+        });
         break;
 
       case 'signal:relay': {
@@ -917,6 +1020,12 @@ export class BroadcastManager {
     this.standbyLinks.clear();
 
     this.ringBuffer.clear();
+    if (this.upstreamWatchdogTimer) {
+      clearInterval(this.upstreamWatchdogTimer);
+      this.upstreamWatchdogTimer = null;
+    }
+    this.originChunkQueue = [];
+    this.incomingPacketQueue = [];
     if (this.reorderQueue) {
       this.reorderQueue.reset();
     }

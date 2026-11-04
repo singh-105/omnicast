@@ -23,6 +23,10 @@ export class MediaRingBuffer {
     this.highestSequence = -1;
     // Track sequence number of the most recent verified keyframe
     this.latestKeyframeSeq = -1;
+    // Keep the first decodable media chunk as a recovery anchor. Some
+    // MediaRecorder implementations expose only one detectable keyframe for
+    // an entire recording epoch.
+    this.bootstrapKeyframe = null;
   }
 
   /**
@@ -49,6 +53,12 @@ export class MediaRingBuffer {
 
     if (chunk.isKeyframe) {
       this.latestKeyframeSeq = chunk.sequence;
+      if (!this.bootstrapKeyframe) {
+        this.bootstrapKeyframe = {
+          ...chunk,
+          payload: chunk.payload instanceof Uint8Array ? chunk.payload.slice() : chunk.payload,
+        };
+      }
     }
 
     this.buffer.set(chunk.sequence, {
@@ -109,8 +119,15 @@ export class MediaRingBuffer {
     }
 
     if (keyframeIndex === -1) {
-      // Do not return arbitrary delta frames without a keyframe base to prevent decoder errors
-      return [];
+      if (!this.bootstrapKeyframe) return [];
+
+      // The anchor may have been evicted from the bounded map. Re-send it
+      // followed by the retained tail so a child can recover without waiting
+      // for a future keyframe.
+      return [
+        this.bootstrapKeyframe,
+        ...all.filter((chunk) => chunk.sequence > this.bootstrapKeyframe.sequence),
+      ];
     }
     return all.slice(keyframeIndex);
   }
@@ -139,27 +156,30 @@ export class MediaRingBuffer {
   prune() {
     const now = Date.now();
 
-    // 1. Evict by age, BUT ALWAYS preserve the latest keyframe and any chunks following it
+    // 1. Evict by age. The ring is deliberately bounded even when a browser
+    // does not expose a detectable keyframe for a long GOP.
     for (const [seq, chunk] of this.buffer) {
-      if (this.latestKeyframeSeq !== -1 && seq >= this.latestKeyframeSeq) {
-        // Protect active GOP from eviction so late joiners can always bootstrap
-        continue;
-      }
       if (now - chunk.bufferedAt > this.maxDurationMs) {
         this.buffer.delete(seq);
       }
     }
 
-    // 2. Evict by max count if still exceeded, strictly preserving latest keyframe GOP
+    // 2. Enforce the hard item bound. A stale keyframe is less harmful than
+    // unbounded memory growth and increasing GC pauses during a live stream.
     if (this.buffer.size > this.maxItems) {
       const sortedKeys = Array.from(this.buffer.keys()).sort((a, b) => a - b);
       for (const seq of sortedKeys) {
         if (this.buffer.size <= this.maxItems) break;
-        if (this.latestKeyframeSeq !== -1 && seq >= this.latestKeyframeSeq) {
-          // Never evict the active keyframe or subsequent frames
-          break;
-        }
         this.buffer.delete(seq);
+      }
+    }
+
+    // Recompute this after eviction so getSinceLatestKeyframe never points at
+    // a chunk that has already left the bounded ring.
+    this.latestKeyframeSeq = -1;
+    for (const chunk of this.buffer.values()) {
+      if (chunk.isKeyframe && chunk.sequence > this.latestKeyframeSeq) {
+        this.latestKeyframeSeq = chunk.sequence;
       }
     }
   }
@@ -169,6 +189,7 @@ export class MediaRingBuffer {
     this.initSegment = null;
     this.highestSequence = -1;
     this.latestKeyframeSeq = -1;
+    this.bootstrapKeyframe = null;
   }
 }
 

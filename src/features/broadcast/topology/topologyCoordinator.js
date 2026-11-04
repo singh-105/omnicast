@@ -101,9 +101,9 @@ export class TopologyCoordinator {
 
     const isMobile = Boolean(capabilities.isMobile);
     // User can opt out of forwarding; mobile devices are non-relaying leaves by default
-    const relayEligible = capabilities.userRelayPermitted !== undefined
+    const relayEligible = !isMobile && (capabilities.userRelayPermitted !== undefined
       ? Boolean(capabilities.userRelayPermitted)
-      : !isMobile;
+      : true);
 
     session.nodes.set(peerId, {
       isMobile,

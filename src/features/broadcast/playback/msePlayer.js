@@ -24,6 +24,7 @@ export class MsePlayer {
     this.isAppending = false;
     this.hasInitSegment = false;
     this.hasFirstKeyframe = false;
+    this.allowPreKeyframeData = false;
     this.waitingForKeyframe = false;
     this.pruneInterval = null;
     this.driftInterval = null;
@@ -84,6 +85,7 @@ export class MsePlayer {
         });
 
         this.sourceBuffer.addEventListener('error', (err) => {
+          this.isAppending = false;
           const videoErr = this.videoElement ? this.videoElement.error : null;
           console.error('[MSE] SourceBuffer error event:', err, 'videoElement.error:', videoErr ? { code: videoErr.code, message: videoErr.message } : null);
           if (this.onError) this.onError(err);
@@ -134,11 +136,13 @@ export class MsePlayer {
       if (!this.hasInitSegment) {
         this.hasInitSegment = true;
         this.hasFirstKeyframe = false; // Must wait for first decodable keyframe
+        this.allowPreKeyframeData = true;
         this.waitingForKeyframe = false;
         this.appendQueue.unshift(buffer);
       } else {
         // Source switch or new epoch: append new track header in order with offset
         this.hasFirstKeyframe = false; // Reset to wait for clean keyframe from new source
+        this.allowPreKeyframeData = true;
         this.waitingForKeyframe = false;
         this.appendQueue.push({ isInitHeader: true, buffer });
       }
@@ -149,10 +153,17 @@ export class MsePlayer {
     // A decoder cannot decode delta frames before its first keyframe arrives!
     if (!this.hasFirstKeyframe) {
       if (!isKeyframe) {
-        // Safely quarantine delta frames until the first keyframe arrives
+        // Keep the WebM cluster context for a late joiner. The bootstrap
+        // sender supplies a bounded contiguous window after the init segment;
+        // dropping those pre-keyframe clusters can make a later keyframe
+        // undecodable even though the bytes themselves arrived intact.
+        if (!this.allowPreKeyframeData) return;
+        this.appendQueue.push(buffer);
+        this.processAppendQueue();
         return;
       }
       this.hasFirstKeyframe = true;
+      this.allowPreKeyframeData = false;
       this.waitingForKeyframe = false;
     }
 
@@ -210,12 +221,8 @@ export class MsePlayer {
 
     this.isAppending = true;
 
-    try {
-      const hexPrefix = Array.from(new Uint8Array(nextBuffer.slice(0, 8)))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join(' ');
-      console.log(`[MSE-DEBUG] Appending chunk (${nextBuffer.byteLength}B) hex: [${hexPrefix}] isInitHeader: ${Boolean(nextItem.isInitHeader)} msState: ${this.mediaSource?.readyState}`);
-      this.sourceBuffer.appendBuffer(nextBuffer);
+      try {
+        this.sourceBuffer.appendBuffer(nextBuffer);
 
       // Attempt autoplay if paused and buffered enough
       if (this.videoElement.paused && this.videoElement.buffered.length > 0) {
@@ -233,6 +240,7 @@ export class MsePlayer {
         // RAM quota reached, aggressively prune and retry
         this.pruneBuffer(true);
         this.appendQueue.unshift(nextBuffer);
+        setTimeout(() => this.processAppendQueue(), 0);
       } else if (this.onError) {
         this.onError(err);
       }

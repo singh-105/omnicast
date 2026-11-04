@@ -44,6 +44,7 @@ export function getEffectiveRtcConfig(customConfig = null) {
 // Backpressure thresholds for RTCDataChannel (128KB low mark, 1MB high mark)
 export const BUFFERED_AMOUNT_LOW_THRESHOLD = 128 * 1024; // 128 KB
 export const MAX_BUFFERED_AMOUNT_HIGH = 1024 * 1024;     // 1024 KB (1 MB)
+export const MAX_PENDING_QUEUE_PACKETS = 256;
 
 export class PeerLink {
   /**
@@ -84,6 +85,7 @@ export class PeerLink {
     this.iceState = 'new';
     this.isBackpressured = false;
     this.pendingQueue = [];
+    this.pendingQueueBytes = 0;
     this.pendingIceCandidates = [];
     this.stats = {
       bytesSent: 0,
@@ -127,7 +129,6 @@ export class PeerLink {
       // Create outbound DataChannels
       this.mediaChannel = this.pc.createDataChannel('omnicast-media', {
         ordered: true,
-        maxRetransmits: 30,
       });
       this.setupMediaChannel(this.mediaChannel);
 
@@ -264,18 +265,26 @@ export class PeerLink {
       return false;
     }
 
-    // Check backpressure on native SCTP DataChannel buffer
-    if (this.mediaChannel.bufferedAmount > MAX_BUFFERED_AMOUNT_HIGH) {
+    // Never overtake packets already queued for this ordered channel. Doing
+    // so lets a newly arrived chunk pass an older bootstrap/gap-recovery
+    // packet and makes the receiver's reorder queue stall indefinitely.
+    if (this.pendingQueue.length > 0 || this.mediaChannel.bufferedAmount > MAX_BUFFERED_AMOUNT_HIGH) {
       this.isBackpressured = true;
-      // Queue whole packet safely without dropping partial fragments
-      if (this.pendingQueue.length < 80) {
+      // Queue whole packets safely without dropping partial fragments during
+      // normal bursts (late-join bootstrap can contain many fragments).
+      if (this.pendingQueue.length < MAX_PENDING_QUEUE_PACKETS) {
         this.pendingQueue.push(arrayBuffer);
+        this.pendingQueueBytes += arrayBuffer.byteLength;
       } else {
         console.warn(`[Transport] Severe backpressure on ${this.remotePeerId.slice(-8)}, queue full (${this.pendingQueue.length} pkts)`);
       }
       return false;
     }
 
+    return this.sendBinaryNow(arrayBuffer);
+  }
+
+  sendBinaryNow(arrayBuffer) {
     try {
       this.mediaChannel.send(arrayBuffer);
       this.stats.bytesSent += arrayBuffer.byteLength;
@@ -288,10 +297,20 @@ export class PeerLink {
   }
 
   flushPendingQueue() {
-    while (this.pendingQueue.length > 0 && !this.isBackpressured) {
+    if (!this.mediaChannel || this.mediaChannel.readyState !== 'open') return;
+
+    while (
+      this.pendingQueue.length > 0 &&
+      this.mediaChannel.bufferedAmount <= MAX_BUFFERED_AMOUNT_HIGH
+    ) {
       const buf = this.pendingQueue.shift();
-      this.sendBinary(buf);
+      this.pendingQueueBytes -= buf.byteLength;
+      if (!this.sendBinaryNow(buf)) {
+        break;
+      }
     }
+
+    this.isBackpressured = this.pendingQueue.length > 0 || this.mediaChannel.bufferedAmount > MAX_BUFFERED_AMOUNT_HIGH;
   }
 
   /**
@@ -359,6 +378,7 @@ export class PeerLink {
       this.pc = null;
     }
     this.pendingQueue = [];
+    this.pendingQueueBytes = 0;
     this.pendingIceCandidates = [];
     this.state = 'closed';
   }

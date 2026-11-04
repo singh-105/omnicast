@@ -45,11 +45,14 @@ async function runSustainedStabilityTest() {
 
     await bcastPage.waitForFunction(() => {
       const input = document.querySelector('input[readonly]');
-      return input && input.value && input.value.includes('watch=');
+      return input && input.value && (input.value.includes('/watch/') || input.value.includes('watch='));
     }, { timeout: 10000 });
 
     const broadcastId = await bcastPage.evaluate(() => {
       const input = document.querySelector('input[readonly]');
+      if (input.value.includes('/watch/')) {
+        return input.value.split('/watch/')[1].split('?')[0].split('/')[0];
+      }
       return input.value.split('watch=')[1].split('&')[0];
     });
 

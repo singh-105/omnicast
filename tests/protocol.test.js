@@ -143,5 +143,15 @@ describe('OmniCast Media Ring Buffer & Reorder Queue', () => {
     queue.push({ sequence: 1 });
     assert.deepEqual(emitted, [0, 1, 2, 3]);
   });
+
+  it('keeps a bootstrap keyframe anchor after bounded-buffer eviction', () => {
+    const ring = new MediaRingBuffer({ maxItems: 2, maxDurationMs: 60000 });
+    ring.add({ sequence: 1, isKeyframe: true, payload: new Uint8Array([1]) });
+    ring.add({ sequence: 2, isKeyframe: false, payload: new Uint8Array([2]) });
+    ring.add({ sequence: 3, isKeyframe: false, payload: new Uint8Array([3]) });
+
+    const bootstrap = ring.getSinceLatestKeyframe();
+    assert.deepEqual(bootstrap.map((chunk) => chunk.sequence), [1, 2, 3]);
+  });
 });
 
