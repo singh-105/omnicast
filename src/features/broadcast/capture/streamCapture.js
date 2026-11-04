@@ -460,6 +460,7 @@ export class StreamCapture {
       mimeType: this.mimeType,
       videoBitsPerSecond: 1200000, // 1.2 Mbps optimal for 720p 30fps VP8
       audioBitsPerSecond: 128000,  // 128 kbps audio
+      videoKeyFrameIntervalDuration: 1000, // Hint browser to generate periodic keyframes (~1s)
     };
 
     try {
@@ -565,10 +566,39 @@ export class StreamCapture {
   probeKeyframe(bytes) {
     if (!bytes || bytes.length < 16) return false;
 
-    // Timeslice blobs are not guaranteed to begin at an EBML cluster
-    // boundary. The first media chunk of each recorder epoch is marked
-    // explicitly above; uncertain later blobs stay delta frames so bootstrap
-    // never starts from a false keyframe inside compressed data.
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const len = u8.length;
+
+    // 1. Probe for VP8 keyframe start code: 0x9D 0x01 0x2A with frame_type == 0 (bit 0 of byte at i-3)
+    // In VP8 uncompressed chunk header, 3-byte start code 0x9D 0x01 0x2A is preceded by 3 bytes
+    // of frame tag. Bit 0 of byte (i-3) is frame_type: 0 = keyframe, 1 = interframe.
+    for (let i = 3; i < len - 3; i++) {
+      if (u8[i] === 0x9D && u8[i + 1] === 0x01 && u8[i + 2] === 0x2A) {
+        const frameTypeBit = u8[i - 3] & 0x01;
+        if (frameTypeBit === 0) {
+          return true;
+        }
+      }
+    }
+
+    // 2. Probe for H.264 IDR slice (type 5) or SPS (type 7)
+    for (let i = 0; i < len - 4; i++) {
+      if (u8[i] === 0x00 && u8[i + 1] === 0x00) {
+        let nalStart = -1;
+        if (u8[i + 2] === 0x01) {
+          nalStart = i + 3;
+        } else if (u8[i + 2] === 0x00 && u8[i + 3] === 0x01) {
+          nalStart = i + 4;
+        }
+        if (nalStart > 0 && nalStart < len) {
+          const nalType = u8[nalStart] & 0x1f;
+          if (nalType === 5 || nalType === 7) {
+            return true;
+          }
+        }
+      }
+    }
+
     return false;
   }
 

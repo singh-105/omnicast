@@ -751,18 +751,18 @@ export class BroadcastManager {
       bootstrapBytes += p.byteLength;
     }
 
-    // 2. Send keyframe + bounded delta window (init-only chunks already sent above)
-    let deltaCount = 0;
+    // 2. Send keyframe + contiguous delta tail up to live edge.
+    // recentChunks is already bounded by getSinceLatestKeyframe (512KB cap).
+    // All chunks from latest keyframe to live edge MUST be sent contiguously
+    // without gaps, otherwise the receiver suffers a sequence gap and WebM
+    // container demuxer error on the interior delta frame.
     let seenKeyframe = false;
     for (const chunk of recentChunks) {
       if (chunk.isInit || chunk.type === PacketType.INIT_SEGMENT) continue;
       if (chunk.isKeyframe) {
         seenKeyframe = true;
-        deltaCount = 0; // Reset delta count at each keyframe
       } else {
-        if (!seenKeyframe) continue; // Skip deltas before first keyframe in window
-        if (deltaCount >= MAX_BOOTSTRAP_DELTA) continue; // Bound delta count
-        deltaCount++;
+        if (!seenKeyframe) continue; // Skip any deltas before first keyframe in window
       }
       const pkts = fragmentChunk({
         type: PacketType.MEDIA_CHUNK,

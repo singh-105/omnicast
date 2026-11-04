@@ -76,6 +76,14 @@ export class MsePlayer {
       this.isSourceOpen = true;
 
       try {
+        // Guard against duplicate addSourceBuffer if sourceopen fires more than once
+        if (this.sourceBuffer || (this.mediaSource.sourceBuffers && this.mediaSource.sourceBuffers.length > 0)) {
+          if (!this.sourceBuffer) {
+            this.sourceBuffer = this.mediaSource.sourceBuffers[0];
+          }
+          this.processAppendQueue();
+          return;
+        }
         this.sourceBuffer = this.mediaSource.addSourceBuffer(this.mimeType);
         this.sourceBuffer.mode = 'segments';
 
@@ -215,7 +223,8 @@ export class MsePlayer {
       !this.sourceBuffer ||
       this.sourceBuffer.updating ||
       this.isAppending ||
-      this.appendQueue.length === 0
+      this.appendQueue.length === 0 ||
+      (this.videoElement && this.videoElement.error)
     ) {
       return;
     }
@@ -269,8 +278,12 @@ export class MsePlayer {
         this.pruneBuffer(true);
         this.appendQueue.unshift(nextBuffer);
         setTimeout(() => this.processAppendQueue(), 0);
-      } else if (this.onError) {
-        this.onError(err);
+      } else {
+        // Fatal or invalid state: clear appendQueue to prevent infinite append retry loop
+        this.appendQueue = [];
+        if (this.onError) {
+          this.onError(err);
+        }
       }
     }
   }

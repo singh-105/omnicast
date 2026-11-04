@@ -53,12 +53,12 @@ export class MediaRingBuffer {
 
     if (chunk.isKeyframe) {
       this.latestKeyframeSeq = chunk.sequence;
-      if (!this.bootstrapKeyframe) {
-        this.bootstrapKeyframe = {
-          ...chunk,
-          payload: chunk.payload instanceof Uint8Array ? chunk.payload.slice() : chunk.payload,
-        };
-      }
+      // Always retain the freshest keyframe as recovery anchor so late-joining
+      // viewers or recovering peers bootstrap from near the live edge.
+      this.bootstrapKeyframe = {
+        ...chunk,
+        payload: chunk.payload instanceof Uint8Array ? chunk.payload.slice() : chunk.payload,
+      };
     }
 
     this.buffer.set(chunk.sequence, {

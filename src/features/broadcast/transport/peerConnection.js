@@ -48,8 +48,8 @@ export function getEffectiveRtcConfig(customConfig = null) {
 // enough for bootstrap burst without accumulating stale live media.
 export const BUFFERED_AMOUNT_LOW_THRESHOLD = 64 * 1024;  // 64 KB low-water mark
 export const MAX_BUFFERED_AMOUNT_HIGH = 512 * 1024;      // 512 KB high-water mark
-export const MAX_PENDING_QUEUE_PACKETS = 64;             // Max packets in app-layer queue
-export const MAX_PENDING_QUEUE_BYTES   = 384 * 1024;    // 384 KB byte ceiling on queue
+export const MAX_PENDING_QUEUE_PACKETS = 128;            // Max packets in app-layer queue
+export const MAX_PENDING_QUEUE_BYTES   = 512 * 1024;    // 512 KB byte ceiling on queue
 // If the oldest queued packet is older than this, the peer is irrecoverably behind.
 // Drop it cleanly here rather than delivering stale data that will make the decoder error.
 export const MAX_PENDING_QUEUE_AGE_MS  = 4000;          // 4 seconds
@@ -304,7 +304,11 @@ export class PeerLink {
         this.pendingQueue.push({ buf: arrayBuffer, queuedAt: Date.now() });
         this.pendingQueueBytes += arrayBuffer.byteLength;
       } else {
-        console.warn(`[Transport] Queue full on ${this.remotePeerId.slice(-8)}: ${this.pendingQueue.length} pkts / ${(this.pendingQueueBytes/1024).toFixed(0)}KB`);
+        const now = Date.now();
+        if (!this._lastQueueFullLog || now - this._lastQueueFullLog > 2000) {
+          this._lastQueueFullLog = now;
+          console.warn(`[Transport] Queue full on ${this.remotePeerId.slice(-8)}: ${this.pendingQueue.length} pkts / ${(this.pendingQueueBytes/1024).toFixed(0)}KB`);
+        }
       }
       return false;
     }
