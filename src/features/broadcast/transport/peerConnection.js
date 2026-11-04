@@ -41,10 +41,18 @@ export function getEffectiveRtcConfig(customConfig = null) {
   return baseConfig;
 }
 
-// Backpressure thresholds for RTCDataChannel (128KB low mark, 1MB high mark)
-export const BUFFERED_AMOUNT_LOW_THRESHOLD = 128 * 1024; // 128 KB
-export const MAX_BUFFERED_AMOUNT_HIGH = 1024 * 1024;     // 1024 KB (1 MB)
-export const MAX_PENDING_QUEUE_PACKETS = 256;
+// Backpressure thresholds for RTCDataChannel
+// FIX-E: Tightened from 1MB to 512KB HIGH mark; reduced queue from 256 to 64 packets.
+// With 1MB HIGH and 256 packets an overtaken viewer accumulated ~30s of backlog silently.
+// 512KB HIGH catches congestion faster; 64-packet queue is ~3-4s at 1.2Mbps which is
+// enough for bootstrap burst without accumulating stale live media.
+export const BUFFERED_AMOUNT_LOW_THRESHOLD = 64 * 1024;  // 64 KB low-water mark
+export const MAX_BUFFERED_AMOUNT_HIGH = 512 * 1024;      // 512 KB high-water mark
+export const MAX_PENDING_QUEUE_PACKETS = 64;             // Max packets in app-layer queue
+export const MAX_PENDING_QUEUE_BYTES   = 384 * 1024;    // 384 KB byte ceiling on queue
+// If the oldest queued packet is older than this, the peer is irrecoverably behind.
+// Drop it cleanly here rather than delivering stale data that will make the decoder error.
+export const MAX_PENDING_QUEUE_AGE_MS  = 4000;          // 4 seconds
 
 export class PeerLink {
   /**
@@ -84,7 +92,7 @@ export class PeerLink {
     this.state = 'new';
     this.iceState = 'new';
     this.isBackpressured = false;
-    this.pendingQueue = [];
+    this.pendingQueue = [];      // Array of { buf: ArrayBuffer, queuedAt: number }
     this.pendingQueueBytes = 0;
     this.pendingIceCandidates = [];
     this.stats = {
@@ -258,25 +266,45 @@ export class PeerLink {
   }
 
   /**
-   * Send binary data packet over the media DataChannel with backpressure queueing.
+   * FIX-E: Send binary data with byte-bounded, age-bounded backpressure queue.
+   *
+   * Changes from pre-fix:
+   * 1. Queue is bounded by BOTH packet count AND total bytes.
+   * 2. Each entry tracks its enqueue timestamp for age-based eviction.
+   * 3. If the oldest queued entry is older than MAX_PENDING_QUEUE_AGE_MS, the
+   *    queue is flushed (peer is irrecoverably behind) so it can re-bootstrap.
+   * 4. This prevents one slow viewer from silently accumulating a 60s backlog
+   *    while other children receive stale data.
    */
   sendBinary(arrayBuffer) {
     if (!this.mediaChannel || this.mediaChannel.readyState !== 'open') {
       return false;
     }
 
-    // Never overtake packets already queued for this ordered channel. Doing
-    // so lets a newly arrived chunk pass an older bootstrap/gap-recovery
-    // packet and makes the receiver's reorder queue stall indefinitely.
+    // Check if oldest queued entry is too old → peer is severely behind.
+    // Drop the queue so the peer falls back to bootstrap recovery rather than
+    // playing minutes of stale video after the queue finally drains.
+    if (this.pendingQueue.length > 0) {
+      const oldestAge = Date.now() - this.pendingQueue[0].queuedAt;
+      if (oldestAge > MAX_PENDING_QUEUE_AGE_MS) {
+        console.warn(`[Transport] Peer ${this.remotePeerId.slice(-8)} queue age ${oldestAge}ms > ${MAX_PENDING_QUEUE_AGE_MS}ms limit. Flushing stale backlog.`);
+        this.pendingQueue = [];
+        this.pendingQueueBytes = 0;
+        this.isBackpressured = false;
+        // Don't send new data either — let the peer re-bootstrap from watchdog
+        return false;
+      }
+    }
+
+    // Never overtake packets already queued for this ordered channel.
     if (this.pendingQueue.length > 0 || this.mediaChannel.bufferedAmount > MAX_BUFFERED_AMOUNT_HIGH) {
       this.isBackpressured = true;
-      // Queue whole packets safely without dropping partial fragments during
-      // normal bursts (late-join bootstrap can contain many fragments).
-      if (this.pendingQueue.length < MAX_PENDING_QUEUE_PACKETS) {
-        this.pendingQueue.push(arrayBuffer);
+      // FIX-E: Enforce BOTH packet count AND byte ceiling
+      if (this.pendingQueue.length < MAX_PENDING_QUEUE_PACKETS && this.pendingQueueBytes < MAX_PENDING_QUEUE_BYTES) {
+        this.pendingQueue.push({ buf: arrayBuffer, queuedAt: Date.now() });
         this.pendingQueueBytes += arrayBuffer.byteLength;
       } else {
-        console.warn(`[Transport] Severe backpressure on ${this.remotePeerId.slice(-8)}, queue full (${this.pendingQueue.length} pkts)`);
+        console.warn(`[Transport] Queue full on ${this.remotePeerId.slice(-8)}: ${this.pendingQueue.length} pkts / ${(this.pendingQueueBytes/1024).toFixed(0)}KB`);
       }
       return false;
     }
@@ -303,9 +331,17 @@ export class PeerLink {
       this.pendingQueue.length > 0 &&
       this.mediaChannel.bufferedAmount <= MAX_BUFFERED_AMOUNT_HIGH
     ) {
-      const buf = this.pendingQueue.shift();
-      this.pendingQueueBytes -= buf.byteLength;
-      if (!this.sendBinaryNow(buf)) {
+      const entry = this.pendingQueue[0];
+      // FIX-E: Age check on flush too — drop entire backlog if stale
+      if (Date.now() - entry.queuedAt > MAX_PENDING_QUEUE_AGE_MS) {
+        console.warn(`[Transport] Flushing stale queue on ${this.remotePeerId.slice(-8)} (${this.pendingQueue.length} packets)`);
+        this.pendingQueue = [];
+        this.pendingQueueBytes = 0;
+        break;
+      }
+      this.pendingQueue.shift();
+      this.pendingQueueBytes -= entry.buf.byteLength;
+      if (!this.sendBinaryNow(entry.buf)) {
         break;
       }
     }
@@ -377,7 +413,7 @@ export class PeerLink {
       } catch (_) {}
       this.pc = null;
     }
-    this.pendingQueue = [];
+    this.pendingQueue = [];      // Reset queue (entries are {buf, queuedAt})
     this.pendingQueueBytes = 0;
     this.pendingIceCandidates = [];
     this.state = 'closed';

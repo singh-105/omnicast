@@ -125,12 +125,37 @@ export class MsePlayer {
    * @param {boolean} isInit
    * @param {boolean} isKeyframe
    */
+  /**
+   * FIX-E (MSE): Append a media chunk to the SourceBuffer.
+   * appendQueue entries are tagged with enqueue time and evicted if >3s old
+   * to prevent stale data causing decoder errors under congestion.
+   */
   appendChunk(chunkBytes, isInit = false, isKeyframe = false) {
     if (this.isDestroyed) return;
 
     const buffer = chunkBytes instanceof Uint8Array
       ? chunkBytes.buffer.slice(chunkBytes.byteOffset, chunkBytes.byteOffset + chunkBytes.byteLength)
       : chunkBytes;
+
+    // FIX-E: Evict stale non-init entries from appendQueue before adding more.
+    // If transport was congested and queued media is >3s old, the timestamps will
+    // be wrong and the decoder will error on out-of-order presentation times.
+    const MAX_APPEND_QUEUE_AGE_MS = 3000;
+    if (!isInit && this.appendQueue.length > 0) {
+      const now = Date.now();
+      let staleCount = 0;
+      this.appendQueue = this.appendQueue.filter(item => {
+        // Keep init headers, special objects without timestamps, and recent items
+        if (item && (item.isInitHeader || !item._queuedAt)) return true;
+        if (now - item._queuedAt < MAX_APPEND_QUEUE_AGE_MS) return true;
+        staleCount++;
+        return false;
+      });
+      if (staleCount > 0) {
+        console.warn(`[MSE] Evicted ${staleCount} stale appendQueue entries (>3s old). Will wait for keyframe.`);
+        this.waitingForKeyframe = true; // Need clean keyframe after dropping stale data
+      }
+    }
 
     if (isInit) {
       if (!this.hasInitSegment) {
@@ -176,7 +201,10 @@ export class MsePlayer {
       this.waitingForKeyframe = false;
     }
 
-    this.appendQueue.push(buffer);
+    // Tag with enqueue time for future age-based eviction
+    const taggedBuffer = buffer;
+    taggedBuffer._queuedAt = Date.now();
+    this.appendQueue.push(taggedBuffer);
     this.processAppendQueue();
   }
 
