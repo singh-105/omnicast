@@ -9,8 +9,14 @@ import { generateKeyPair, privateKeyFromProtobuf, privateKeyToProtobuf } from '@
 import { WebSocketServer } from 'ws';
 import http from 'node:http';
 import net from 'node:net';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import fs from 'fs';
 import { TopologyCoordinator } from './src/features/broadcast/topology/topologyCoordinator.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DIST_DIR = path.join(__dirname, 'dist');
 
 const KEY_FILE = './relay-key.json';
 const SIGNALING_PATH = '/signaling';
@@ -531,6 +537,55 @@ async function main() {
         res.end(JSON.stringify({ error: 'Broadcast not found' }));
       }
       return;
+    }
+
+    // ── Static Frontend & SPA Serving (Production dist/) ──
+    if (fs.existsSync(DIST_DIR)) {
+      const decodedPath = decodeURIComponent(urlPath);
+      let relativePath = (decodedPath === '' || decodedPath === '/') ? '/index.html' : decodedPath;
+      let filePath = path.normalize(path.join(DIST_DIR, relativePath));
+
+      // Security check: ensure path is strictly inside DIST_DIR
+      if (filePath.startsWith(DIST_DIR) && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        const ext = path.extname(filePath).toLowerCase();
+        const contentTypes = {
+          '.html': 'text/html; charset=utf-8',
+          '.js': 'application/javascript; charset=utf-8',
+          '.mjs': 'application/javascript; charset=utf-8',
+          '.css': 'text/css; charset=utf-8',
+          '.json': 'application/json',
+          '.png': 'image/png',
+          '.jpg': 'image/jpeg',
+          '.jpeg': 'image/jpeg',
+          '.svg': 'image/svg+xml',
+          '.ico': 'image/x-icon',
+          '.webp': 'image/webp',
+          '.wasm': 'application/wasm',
+          '.woff': 'font/woff',
+          '.woff2': 'font/woff2',
+        };
+        const contentType = contentTypes[ext] || 'application/octet-stream';
+        const isHashedAsset = relativePath.startsWith('/assets/');
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          'Cache-Control': isHashedAsset
+            ? 'public, max-age=31536000, immutable'
+            : 'no-cache, no-store, must-revalidate',
+        });
+        fs.createReadStream(filePath).pipe(res);
+        return;
+      }
+
+      // SPA fallback: return index.html for frontend routes (e.g. /studio, /watch/:id, /explore)
+      const indexPath = path.join(DIST_DIR, 'index.html');
+      if (req.method === 'GET' && fs.existsSync(indexPath)) {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+        });
+        fs.createReadStream(indexPath).pipe(res);
+        return;
+      }
     }
 
     res.writeHead(200, { 'Content-Type': 'text/plain' });

@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "start": "node relay.js",
     "dev": "concurrently \"vite --host\" \"node relay.js\"",
     "build": "vite build",
     "serve": "vite preview",
