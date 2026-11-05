@@ -25,6 +25,31 @@ export const WatcherView = ({
   const videoRef = useRef(null);
   const containerRef = useRef(null);
 
+  const [localMetrics, setLocalMetrics] = useState(metrics || {});
+
+  // Subscribe to real-time live metrics and poll every 400ms to guarantee continuous updates
+  useEffect(() => {
+    if (!broadcastManager) return;
+    const orig = broadcastManager.onMetrics;
+    broadcastManager.onMetrics = (m) => {
+      if (orig) orig(m);
+      setLocalMetrics({ ...m });
+    };
+
+    const pollInterval = setInterval(() => {
+      if (broadcastManager.metrics) {
+        setLocalMetrics({ ...broadcastManager.metrics });
+      }
+    }, 400);
+
+    return () => {
+      clearInterval(pollInterval);
+      broadcastManager.onMetrics = orig;
+    };
+  }, [broadcastManager]);
+
+  const displayMetrics = { ...metrics, ...localMetrics, ...(broadcastManager?.metrics || {}) };
+
   const [isPlaying, setIsPlaying] = useState(true);
   const [isMuted, setIsMuted] = useState(true);
   const [volume, setVolume] = useState(1);
@@ -93,8 +118,13 @@ export const WatcherView = ({
         }
       };
 
+      const handlePause = () => setIsPlaying(false);
+      const handlePlay = () => setIsPlaying(true);
+
       video.addEventListener('playing', handlePlaying);
       video.addEventListener('waiting', handleWaiting);
+      video.addEventListener('pause', handlePause);
+      video.addEventListener('play', handlePlay);
 
       // Listen for manager state changes
       const originalOnStateChange = broadcastManager.onStateChange;
@@ -137,6 +167,8 @@ export const WatcherView = ({
       return () => {
         video.removeEventListener('playing', handlePlaying);
         video.removeEventListener('waiting', handleWaiting);
+        video.removeEventListener('pause', handlePause);
+        video.removeEventListener('play', handlePlay);
         broadcastManager.onStateChange = originalOnStateChange;
         broadcastManager.onLiveStateChange = originalOnLiveStateChange;
         broadcastManager.stopBroadcast();
@@ -144,25 +176,49 @@ export const WatcherView = ({
     }
   }, [broadcastId]);
 
-  const handleRetry = () => {
-    if (videoRef.current && broadcastId) {
+  const handleRetry = (e) => {
+    if (e) {
+      if (e.preventDefault) e.preventDefault();
+      if (e.stopPropagation) e.stopPropagation();
+    }
+    if (broadcastId) {
       setConnectionState('connecting');
       setErrorMessage('');
-      broadcastManager.joinBroadcast({
-        broadcastId,
-        videoElement: videoRef.current,
-      });
+      setPreparingSlow(false);
+      setAutoplayBlocked(false);
+      if (videoRef.current) {
+        broadcastManager.joinBroadcast({
+          broadcastId,
+          videoElement: videoRef.current,
+        });
+      }
     }
   };
 
-  const togglePlay = () => {
+  const handleGoHome = (e) => {
+    if (e) {
+      if (e.preventDefault) e.preventDefault();
+      if (e.stopPropagation) e.stopPropagation();
+    }
+    if (onBack) {
+      onBack();
+    } else {
+      window.location.href = '/';
+    }
+  };
+
+  const togglePlay = (e) => {
+    if (e) {
+      if (e.preventDefault) e.preventDefault();
+      if (e.stopPropagation) e.stopPropagation();
+    }
     if (!videoRef.current) return;
     if (videoRef.current.paused) {
       videoRef.current.play().then(() => {
         setIsPlaying(true);
         setAutoplayBlocked(false);
-      }).catch((e) => {
-        if (e.name === 'NotAllowedError') {
+      }).catch((err) => {
+        if (err.name === 'NotAllowedError') {
           setAutoplayBlocked(true);
         }
       });
@@ -242,7 +298,7 @@ export const WatcherView = ({
         {/* Real Viewer Count */}
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl border border-[#29292F] bg-[#141418] font-mono text-xs text-white">
           <Users className="w-3.5 h-3.5 text-neon-rose" />
-          <span>{metrics.viewerCount || 0} watching</span>
+          <span>{displayMetrics.viewerCount || 0} watching</span>
         </div>
       </div>
 
@@ -262,7 +318,7 @@ export const WatcherView = ({
 
         {/* State Overlays */}
         {connectionState === 'connecting' && (
-          <div className="absolute inset-0 bg-[#0A0A0A]/80 backdrop-blur-xs flex flex-col items-center justify-center gap-3 pointer-events-none">
+          <div className="absolute inset-0 z-30 bg-[#0A0A0A]/80 backdrop-blur-xs flex flex-col items-center justify-center gap-3 pointer-events-none">
             <div className="w-10 h-10 border-3 border-cerulean-bright border-t-transparent rounded-full animate-spin shadow-[0_0_20px_rgba(0,194,255,0.4)]" />
             <span className="text-xs font-mono text-white tracking-wide">
               Connecting to broadcast...
@@ -271,15 +327,16 @@ export const WatcherView = ({
         )}
 
         {connectionState === 'preparing' && (
-          <div className="absolute inset-0 bg-[#0A0A0A]/70 backdrop-blur-xs flex flex-col items-center justify-center gap-3">
+          <div className="absolute inset-0 z-30 bg-[#0A0A0A]/70 backdrop-blur-xs flex flex-col items-center justify-center gap-3">
             <div className="w-10 h-10 border-3 border-cerulean-bright border-t-transparent rounded-full animate-spin shadow-[0_0_20px_rgba(0,194,255,0.4)]" />
             <span className="text-xs font-mono text-white tracking-wide">
               Preparing live video stream...
             </span>
             {(preparingSlow || autoplayBlocked) && (
               <button
+                type="button"
                 onClick={togglePlay}
-                className="mt-2 px-5 py-2.5 rounded-xl bg-neon-rose text-white font-display font-bold text-xs uppercase tracking-wider shadow-lg hover:brightness-110 transition-all cursor-pointer flex items-center gap-2"
+                className="mt-2 px-5 py-2.5 rounded-xl bg-neon-rose text-white font-display font-bold text-xs uppercase tracking-wider shadow-lg hover:brightness-110 active:scale-95 transition-all cursor-pointer flex items-center gap-2"
               >
                 <Play className="w-3.5 h-3.5 fill-current" />
                 <span>Tap to Play Live</span>
@@ -289,7 +346,7 @@ export const WatcherView = ({
         )}
 
         {connectionState === 'buffering' && (
-          <div className="absolute inset-0 bg-[#0A0A0A]/50 backdrop-blur-xs flex flex-col items-center justify-center gap-3 pointer-events-none">
+          <div className="absolute inset-0 z-30 bg-[#0A0A0A]/50 backdrop-blur-xs flex flex-col items-center justify-center gap-3 pointer-events-none">
             <div className="w-10 h-10 border-3 border-cerulean-bright border-t-transparent rounded-full animate-spin" />
             <span className="text-xs font-mono text-white">
               Buffering stream...
@@ -298,7 +355,7 @@ export const WatcherView = ({
         )}
 
         {connectionState === 'full' && (
-          <div className="absolute inset-0 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
+          <div className="absolute inset-0 z-30 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
             <div className="w-12 h-12 rounded-full bg-[#1E1E26] flex items-center justify-center text-neon-rose">
               <AlertCircle className="w-6 h-6" />
             </div>
@@ -306,14 +363,16 @@ export const WatcherView = ({
             <p className="text-xs font-mono text-[#A1A1AA]">{errorMessage || 'Maximum viewer limit reached (500 viewers). Please try again later.'}</p>
             <div className="flex items-center gap-3 mt-2">
               <button
+                type="button"
                 onClick={handleRetry}
-                className="px-4 py-2 rounded-xl border border-cerulean text-cerulean-bright font-display font-bold text-xs uppercase cursor-pointer"
+                className="px-4 py-2 rounded-xl border border-cerulean text-cerulean-bright font-display font-bold text-xs uppercase cursor-pointer hover:bg-cerulean/20 transition-all active:scale-95"
               >
                 Retry
               </button>
               <button
-                onClick={onBack}
-                className="px-4 py-2 rounded-xl bg-cerulean text-white font-display font-bold text-xs uppercase cursor-pointer"
+                type="button"
+                onClick={handleGoHome}
+                className="px-4 py-2 rounded-xl bg-cerulean text-white font-display font-bold text-xs uppercase cursor-pointer hover:bg-cerulean-bright hover:text-zinc-950 transition-all active:scale-95"
               >
                 Return Home
               </button>
@@ -322,23 +381,26 @@ export const WatcherView = ({
         )}
 
         {connectionState === 'ended' && (
-          <div className="absolute inset-0 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
+          <div className="absolute inset-0 z-30 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
             <div className="w-12 h-12 rounded-full bg-[#1E1E26] flex items-center justify-center text-[#A1A1AA]">
               <AlertCircle className="w-6 h-6 text-neon-rose" />
             </div>
             <p className="text-base font-display font-bold text-white">This broadcast has ended</p>
             <p className="text-xs font-mono text-[#A1A1AA]">The broadcaster stopped transmitting.</p>
-            <button
-              onClick={onBack}
-              className="mt-2 px-5 py-2.5 rounded-xl bg-cerulean text-white font-display font-bold text-xs uppercase cursor-pointer"
-            >
-              Browse Streams
-            </button>
+            <div className="flex items-center gap-3 mt-2">
+              <button
+                type="button"
+                onClick={handleGoHome}
+                className="px-5 py-2.5 rounded-xl bg-cerulean text-white font-display font-bold text-xs uppercase cursor-pointer hover:bg-cerulean-bright hover:text-zinc-950 transition-all active:scale-95"
+              >
+                Browse Streams
+              </button>
+            </div>
           </div>
         )}
 
         {connectionState === 'not_found' && (
-          <div className="absolute inset-0 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
+          <div className="absolute inset-0 z-30 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
             <div className="w-12 h-12 rounded-full bg-[#1E1E26] flex items-center justify-center text-neon-rose">
               <AlertCircle className="w-6 h-6" />
             </div>
@@ -346,14 +408,16 @@ export const WatcherView = ({
             <p className="text-xs font-mono text-[#A1A1AA]">The broadcast session ID does not exist or has ended.</p>
             <div className="flex items-center gap-3 mt-2">
               <button
+                type="button"
                 onClick={handleRetry}
-                className="px-4 py-2 rounded-xl border border-cerulean text-cerulean-bright font-display font-bold text-xs uppercase cursor-pointer"
+                className="px-4 py-2 rounded-xl border border-cerulean text-cerulean-bright font-display font-bold text-xs uppercase cursor-pointer hover:bg-cerulean/20 transition-all active:scale-95"
               >
                 Retry
               </button>
               <button
-                onClick={onBack}
-                className="px-4 py-2 rounded-xl bg-cerulean text-white font-display font-bold text-xs uppercase cursor-pointer"
+                type="button"
+                onClick={handleGoHome}
+                className="px-4 py-2 rounded-xl bg-cerulean text-white font-display font-bold text-xs uppercase cursor-pointer hover:bg-cerulean-bright hover:text-zinc-950 transition-all active:scale-95"
               >
                 Return Home
               </button>
@@ -362,18 +426,28 @@ export const WatcherView = ({
         )}
 
         {connectionState === 'error' && (
-          <div className="absolute inset-0 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
+          <div className="absolute inset-0 z-30 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
             <div className="w-12 h-12 rounded-full bg-[#1E1E26] flex items-center justify-center text-neon-rose">
               <AlertCircle className="w-6 h-6" />
             </div>
             <p className="text-base font-display font-bold text-white">Connection Error</p>
             <p className="text-xs font-mono text-[#A1A1AA]">{errorMessage || 'Could not connect to stream.'}</p>
-            <button
-              onClick={handleRetry}
-              className="mt-2 px-5 py-2.5 rounded-xl bg-cerulean text-white font-display font-bold text-xs uppercase cursor-pointer"
-            >
-              Retry Connection
-            </button>
+            <div className="flex items-center gap-3 mt-2">
+              <button
+                type="button"
+                onClick={handleRetry}
+                className="px-4 py-2 rounded-xl bg-cerulean text-white font-display font-bold text-xs uppercase cursor-pointer hover:bg-cerulean-bright hover:text-zinc-950 transition-all active:scale-95"
+              >
+                Retry Connection
+              </button>
+              <button
+                type="button"
+                onClick={handleGoHome}
+                className="px-4 py-2 rounded-xl border border-cerulean text-cerulean-bright font-display font-bold text-xs uppercase cursor-pointer hover:bg-cerulean/20 transition-all active:scale-95"
+              >
+                Return Home
+              </button>
+            </div>
           </div>
         )}
 
@@ -420,12 +494,13 @@ export const WatcherView = ({
           </div>
 
           <div className="flex items-center gap-3">
-            {metrics.liveLatencyMs > 0 && (
+            {displayMetrics.liveLatencyMs > 0 && (
               <span className="text-xs font-mono text-cerulean-bright font-semibold">
-                ~{metrics.liveLatencyMs} ms delay
+                ~{displayMetrics.liveLatencyMs} ms delay
               </span>
             )}
             <button
+              type="button"
               onClick={toggleFullscreen}
               className="p-2 rounded-lg hover:bg-white/10 transition-colors cursor-pointer text-white"
             >
@@ -438,6 +513,7 @@ export const WatcherView = ({
       {/* ─── COLLAPSIBLE DIAGNOSTICS & P2P MESH PANEL ─── */}
       <div className="rounded-2xl border border-[#29292F] bg-[#141418] overflow-hidden">
         <button
+          type="button"
           onClick={() => setShowDiagnostics(!showDiagnostics)}
           className="w-full px-5 py-3.5 flex items-center justify-between text-xs font-mono text-[#A1A1AA] hover:text-white transition-colors cursor-pointer"
         >
@@ -454,22 +530,22 @@ export const WatcherView = ({
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Mesh Tier</span>
                 <p className="text-sm font-bold text-cerulean-bright mt-0.5">
-                  {metrics.tier === null ? 'Pending' : `Tier ${metrics.tier} ${metrics.activeChildren > 0 ? '(Relay)' : '(Leaf)'}`}
+                  {displayMetrics.tier === null ? 'Pending' : `Tier ${displayMetrics.tier} ${displayMetrics.activeChildren > 0 ? '(Relay)' : '(Leaf)'}`}
                 </p>
               </div>
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Upstream Source</span>
                 <p className="text-sm font-bold text-white mt-0.5">
-                  {metrics.parentPeerId ? metrics.parentPeerId.slice(-8) : (metrics.tier === 1 ? 'Broadcaster (Direct)' : 'Connecting...')}
+                  {displayMetrics.parentPeerId ? displayMetrics.parentPeerId.slice(-8) : (displayMetrics.tier === 1 ? 'Broadcaster (Direct)' : 'Connecting...')}
                 </p>
               </div>
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Bitrate</span>
-                <p className="text-sm font-bold text-cerulean-bright mt-0.5">{metrics.bitrateKbps} kbps</p>
+                <p className="text-sm font-bold text-cerulean-bright mt-0.5">{displayMetrics.bitrateKbps || 0} kbps</p>
               </div>
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Relaying To</span>
-                <p className="text-sm font-bold text-white mt-0.5">{metrics.activeChildren} children</p>
+                <p className="text-sm font-bold text-white mt-0.5">{displayMetrics.activeChildren || 0} children</p>
               </div>
             </div>
 
@@ -478,31 +554,31 @@ export const WatcherView = ({
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Chunks In / Fwd</span>
                 <p className="text-sm font-bold text-white mt-0.5">
-                  {metrics.chunksReceived || 0} / {metrics.chunksForwarded || 0}
+                  {displayMetrics.chunksReceived || 0} / {displayMetrics.chunksForwarded || 0}
                 </p>
               </div>
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Last Packet Age</span>
                 <p className="text-sm font-bold text-white mt-0.5">
-                  {metrics.lastPacketAtAgeMs != null ? `${metrics.lastPacketAtAgeMs} ms` : 'N/A'}
+                  {displayMetrics.lastPacketAtAgeMs != null ? `${displayMetrics.lastPacketAtAgeMs} ms` : 'N/A'}
                 </p>
               </div>
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Decoder State</span>
-                <p className={`text-sm font-bold mt-0.5 ${metrics.waitingForKeyframe ? 'text-neon-rose' : 'text-cerulean-bright'}`}>
-                  {metrics.waitingForKeyframe ? 'Awaiting Keyframe' : 'Synced'}
+                <p className={`text-sm font-bold mt-0.5 ${displayMetrics.waitingForKeyframe ? 'text-neon-rose' : 'text-cerulean-bright'}`}>
+                  {displayMetrics.waitingForKeyframe ? 'Awaiting Keyframe' : 'Synced'}
                 </p>
               </div>
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Gaps Skipped</span>
-                <p className="text-sm font-bold text-white mt-0.5">{metrics.gapsSkipped || 0}</p>
+                <p className="text-sm font-bold text-white mt-0.5">{displayMetrics.gapsSkipped || 0}</p>
               </div>
             </div>
 
             <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] flex items-center justify-between">
               <span className="text-[10px] text-[#A1A1AA] uppercase">ICE Transport Candidate</span>
               <span className="text-xs font-mono text-cerulean-bright font-bold">
-                {metrics.selectedCandidateType || 'unknown'}
+                {displayMetrics.selectedCandidateType || 'unknown'}
               </span>
             </div>
 
@@ -511,19 +587,19 @@ export const WatcherView = ({
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] space-y-2">
                 <span className="text-[10px] text-[#A1A1AA] uppercase font-bold">Debug: ICE Candidate Types</span>
                 <div className="space-y-1">
-                  {metrics.parentPeerId && (
+                  {displayMetrics.parentPeerId && (
                     <div className="flex items-center justify-between text-[11px] py-0.5">
-                      <span className="text-white font-mono">↑ Parent {metrics.parentPeerId.slice(-8)}</span>
-                      <span className="text-cerulean-bright font-bold">{metrics.selectedCandidateType || '?'}</span>
+                      <span className="text-white font-mono">↑ Parent {displayMetrics.parentPeerId.slice(-8)}</span>
+                      <span className="text-cerulean-bright font-bold">{displayMetrics.selectedCandidateType || '?'}</span>
                     </div>
                   )}
-                  {metrics.childLinks && metrics.childLinks.map((child, idx) => (
+                  {displayMetrics.childLinks && displayMetrics.childLinks.map((child, idx) => (
                     <div key={`ice-${idx}`} className="flex items-center justify-between text-[11px] py-0.5">
                       <span className="text-white font-mono">↓ Child {child.peerId.slice(-8)}</span>
                       <span className="text-cerulean-bright font-bold">{child.candidateType || '?'}</span>
                     </div>
                   ))}
-                  {(!metrics.parentPeerId && (!metrics.childLinks || metrics.childLinks.length === 0)) && (
+                  {(!displayMetrics.parentPeerId && (!displayMetrics.childLinks || displayMetrics.childLinks.length === 0)) && (
                     <span className="text-[#A1A1AA] text-[10px]">No active links</span>
                   )}
                 </div>
@@ -531,11 +607,11 @@ export const WatcherView = ({
             )}
 
             {/* Downstream Children Diagnostics */}
-            {metrics.childLinks && metrics.childLinks.length > 0 && (
+            {displayMetrics.childLinks && displayMetrics.childLinks.length > 0 && (
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] space-y-2">
                 <span className="text-[10px] text-[#A1A1AA] uppercase font-bold">Connected Downstream Peers</span>
                 <div className="space-y-1.5">
-                  {metrics.childLinks.map((child, idx) => (
+                  {displayMetrics.childLinks.map((child, idx) => (
                     <div key={idx} className="flex items-center justify-between text-[11px] py-1 border-b border-[#29292F]/40 last:border-0">
                       <span className="font-mono text-white">Peer {child.peerId.slice(-8)}</span>
                       <div className="flex items-center gap-3">
@@ -555,13 +631,13 @@ export const WatcherView = ({
               </div>
             )}
 
-            {metrics.fingerprint && (
+            {displayMetrics.fingerprint && (
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] space-y-1">
                 <div className="flex items-center gap-1.5 text-cerulean-bright">
                   <ShieldCheck className="w-3.5 h-3.5" />
                   <span className="font-bold text-[10px] uppercase">Verified Origin Fingerprint</span>
                 </div>
-                <p className="text-[11px] text-[#A1A1AA] break-all select-all">{metrics.fingerprint}</p>
+                <p className="text-[11px] text-[#A1A1AA] break-all select-all">{displayMetrics.fingerprint}</p>
               </div>
             )}
 

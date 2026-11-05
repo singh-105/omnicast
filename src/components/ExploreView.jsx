@@ -84,9 +84,14 @@ export const ExploreView = ({
 
         <div className="flex items-center gap-3">
           <button
-            onClick={onRefreshBroadcasts}
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              if (onRefreshBroadcasts) onRefreshBroadcasts();
+            }}
             disabled={isLoading}
-            className="p-3 rounded-xl border border-[#29292F] bg-[#141418] hover:bg-[#18181E] text-[#A1A1AA] hover:text-white transition-all cursor-pointer disabled:opacity-50"
+            className="p-3 rounded-xl border border-[#29292F] bg-[#141418] hover:bg-[#18181E] active:scale-95 text-[#A1A1AA] hover:text-white transition-all cursor-pointer disabled:opacity-50"
             title="Refresh active broadcasts"
           >
             <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-cerulean-bright' : ''}`} />

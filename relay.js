@@ -508,8 +508,13 @@ async function main() {
       return;
     }
 
-    if (req.url === '/api/broadcasts') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+    const urlPath = (req.url || '').split('?')[0].replace(/\/$/, '');
+
+    if (urlPath === '/api/broadcasts') {
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+      });
       res.end(JSON.stringify(topologyCoordinator.listBroadcasts()));
       return;
     }

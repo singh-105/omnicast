@@ -83,7 +83,15 @@ export const StudioView = ({
       if (orig) orig(m);
       setLocalMetrics({ ...m });
     };
+
+    const pollInterval = setInterval(() => {
+      if (broadcastManager.metrics) {
+        setLocalMetrics({ ...broadcastManager.metrics });
+      }
+    }, 400);
+
     return () => {
+      clearInterval(pollInterval);
       broadcastManager.onMetrics = orig;
     };
   }, [broadcastManager]);

@@ -120,15 +120,6 @@ export class BroadcastManager {
     this.lastBytesReceived = 0;
     this.lastBytesSent = 0;
 
-    // State & Event Callbacks
-    this.onStateChange = null;
-    this.onLiveStateChange = null;
-    this.onError = null;
-    this.onBroadcastsList = null;
-    this.onBroadcastAnnounced = null;
-    this.onBroadcastEnded = null;
-    this.onMetrics = null;
-
     this.pendingWsMessages = [];
   }
 
@@ -414,6 +405,11 @@ export class BroadcastManager {
     this.role = 'viewer';
     this.broadcastId = broadcastId;
 
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      await this.connectSignaling().catch(() => {});
+    }
+    this.startMetricsLoop();
+
     // Set up reorder queue for sequential playback
     this.reorderQueue = new SequenceReorderQueue({
       onEmit: (chunk) => this.renderChunk(chunk),
@@ -447,6 +443,9 @@ export class BroadcastManager {
     this.tier = tier;
     this.metrics.tier = tier;
     this.metrics.parentPeerId = parentPeerId;
+    if (this.onMetrics) {
+      this.onMetrics({ ...this.metrics });
+    }
     this.standbyCandidateIds = standbyParents || [];
     this.streamMimeType = mimeType || this.streamMimeType;
 

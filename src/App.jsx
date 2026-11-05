@@ -81,7 +81,7 @@ export default function App() {
   const fetchActiveBroadcasts = useCallback(async () => {
     setIsBroadcastsLoading(true);
     try {
-      const res = await fetch('/api/broadcasts');
+      const res = await fetch(`/api/broadcasts?_t=${Date.now()}`, { cache: 'no-store' });
       if (res.ok) {
         const list = await res.json();
         setActiveBroadcasts(Array.isArray(list) ? list : []);
