@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const ARTIFACT_DIR = 'C:\\Users\\Harsh Singh\\.gemini\\antigravity\\brain\\678eb192-ff9d-48da-b8bb-5fc107e23d85';
+const ARTIFACT_DIR = process.env.ARTIFACT_DIR || null;
 
 async function runVisualTests() {
   console.log('🎨 Starting OmniCast Visual & UI Verification Suite...');
@@ -24,11 +24,13 @@ async function runVisualTests() {
 
   const saveBoth = async (page, filename) => {
     const localP = path.join(screenshotsDir, filename);
-    const artP = path.join(ARTIFACT_DIR, filename);
     await page.screenshot({ path: localP, fullPage: true });
-    try {
-      await page.screenshot({ path: artP, fullPage: true });
-    } catch (_) {}
+    if (ARTIFACT_DIR) {
+      const artP = path.join(ARTIFACT_DIR, filename);
+      try {
+        await page.screenshot({ path: artP, fullPage: true });
+      } catch (_) {}
+    }
     console.log(`   Saved: ${filename}`);
   };
 

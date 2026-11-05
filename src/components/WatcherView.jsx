@@ -31,9 +31,21 @@ export const WatcherView = ({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const [preparingSlow, setPreparingSlow] = useState(false);
-  const [connectionState, setConnectionState] = useState('connecting'); // 'connecting' | 'preparing' | 'playing' | 'buffering' | 'ended' | 'not_found' | 'error'
+  const [connectionState, setConnectionState] = useState('connecting'); // 'connecting' | 'preparing' | 'playing' | 'buffering' | 'ended' | 'not_found' | 'error' | 'full'
   const [errorMessage, setErrorMessage] = useState('');
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [debugMode] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return new URLSearchParams(window.location.search).get('debug') === '1';
+    } catch (_) { return false; }
+  });
+
+  // Prevent stale closure in event handlers
+  const connectionStateRef = useRef(connectionState);
+  useEffect(() => {
+    connectionStateRef.current = connectionState;
+  }, [connectionState]);
 
   useEffect(() => {
     let t = null;
@@ -58,16 +70,26 @@ export const WatcherView = ({
       });
 
       const video = videoRef.current;
+      let waitingDebounce = null;
 
       const handlePlaying = () => {
+        if (waitingDebounce) {
+          clearTimeout(waitingDebounce);
+          waitingDebounce = null;
+        }
         setConnectionState('playing');
         setIsPlaying(true);
         setAutoplayBlocked(false);
       };
 
       const handleWaiting = () => {
-        if (connectionState === 'playing') {
-          setConnectionState('buffering');
+        if (connectionStateRef.current === 'playing' && !waitingDebounce) {
+          waitingDebounce = setTimeout(() => {
+            waitingDebounce = null;
+            if (connectionStateRef.current === 'playing' || connectionStateRef.current === 'buffering') {
+              setConnectionState('buffering');
+            }
+          }, 600);
         }
       };
 
@@ -76,11 +98,22 @@ export const WatcherView = ({
 
       // Listen for manager state changes
       const originalOnStateChange = broadcastManager.onStateChange;
+      const originalOnLiveStateChange = broadcastManager.onLiveStateChange;
+
       broadcastManager.onStateChange = (state, newMetrics) => {
         if (originalOnStateChange) originalOnStateChange(state, newMetrics);
 
-        if (state === 'streaming' && connectionState === 'connecting') {
-          setConnectionState('preparing');
+        if (state === 'streaming') {
+          if (connectionStateRef.current === 'connecting') {
+            setConnectionState('preparing');
+          } else if (connectionStateRef.current === 'buffering') {
+            if (videoRef.current && !videoRef.current.paused && videoRef.current.readyState >= 2) {
+              setConnectionState('playing');
+            }
+          }
+        } else if (state === 'full') {
+          setConnectionState('full');
+          setErrorMessage('Stream is at capacity (maximum viewer limit reached)');
         } else if (state === 'ended') {
           setConnectionState('ended');
         } else if (state === 'not_found') {
@@ -88,13 +121,14 @@ export const WatcherView = ({
           setErrorMessage('Broadcast not found or has already ended');
         } else if (state === 'error') {
           setConnectionState('error');
-          setErrorMessage('Connection error occurred');
+          setErrorMessage(newMetrics?.errorMessage || 'Connection error occurred');
         } else if (state === 'reconnecting') {
           setConnectionState('buffering');
         }
       };
 
       broadcastManager.onLiveStateChange = (liveState) => {
+        if (originalOnLiveStateChange) originalOnLiveStateChange(liveState);
         if (liveState?.autoplayBlocked) {
           setAutoplayBlocked(true);
         }
@@ -103,6 +137,8 @@ export const WatcherView = ({
       return () => {
         video.removeEventListener('playing', handlePlaying);
         video.removeEventListener('waiting', handleWaiting);
+        broadcastManager.onStateChange = originalOnStateChange;
+        broadcastManager.onLiveStateChange = originalOnLiveStateChange;
         broadcastManager.stopBroadcast();
       };
     }
@@ -261,6 +297,30 @@ export const WatcherView = ({
           </div>
         )}
 
+        {connectionState === 'full' && (
+          <div className="absolute inset-0 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
+            <div className="w-12 h-12 rounded-full bg-[#1E1E26] flex items-center justify-center text-neon-rose">
+              <AlertCircle className="w-6 h-6" />
+            </div>
+            <p className="text-base font-display font-bold text-white">Stream is at capacity</p>
+            <p className="text-xs font-mono text-[#A1A1AA]">{errorMessage || 'Maximum viewer limit reached (500 viewers). Please try again later.'}</p>
+            <div className="flex items-center gap-3 mt-2">
+              <button
+                onClick={handleRetry}
+                className="px-4 py-2 rounded-xl border border-cerulean text-cerulean-bright font-display font-bold text-xs uppercase cursor-pointer"
+              >
+                Retry
+              </button>
+              <button
+                onClick={onBack}
+                className="px-4 py-2 rounded-xl bg-cerulean text-white font-display font-bold text-xs uppercase cursor-pointer"
+              >
+                Return Home
+              </button>
+            </div>
+          </div>
+        )}
+
         {connectionState === 'ended' && (
           <div className="absolute inset-0 bg-[#0A0A0A]/95 flex flex-col items-center justify-center gap-3">
             <div className="w-12 h-12 rounded-full bg-[#1E1E26] flex items-center justify-center text-[#A1A1AA]">
@@ -317,21 +377,21 @@ export const WatcherView = ({
           </div>
         )}
 
-        {/* Autoplay Muted Notice */}
-        {autoplayBlocked && connectionState === 'playing' && (
-          <div className="absolute top-4 inset-x-4 max-w-sm mx-auto p-3 rounded-xl bg-neon-rose text-white text-xs font-bold flex items-center justify-between shadow-xl z-30">
-            <span>Audio is muted by browser.</span>
+        {/* Floating Unmute Button (Essential for mobile & desktop autoplay policy) */}
+        {isMuted && connectionState === 'playing' && (
+          <div className="absolute top-4 inset-x-4 max-w-xs mx-auto z-30">
             <button
               onClick={toggleMute}
-              className="px-3 py-1 rounded-lg bg-white text-zinc-950 text-xs font-bold uppercase cursor-pointer"
+              className="w-full px-4 py-2.5 rounded-full bg-cerulean text-white text-xs font-mono font-bold flex items-center justify-center gap-2 shadow-2xl hover:brightness-110 active:scale-95 transition-all cursor-pointer animate-pulse"
             >
-              Unmute
+              <Volume2 className="w-4 h-4 fill-current" />
+              <span>Tap to Unmute Stream Audio</span>
             </button>
           </div>
         )}
 
         {/* Player Controls Bar */}
-        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-[#0A0A0A]/90 via-[#0A0A0A]/40 to-transparent p-4 opacity-0 group-hover:opacity-100 transition-opacity duration-200 flex items-center justify-between z-20">
+        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-[#0A0A0A]/90 via-[#0A0A0A]/40 to-transparent p-4 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-200 flex items-center justify-between z-20">
           <div className="flex items-center gap-3">
             <button
               onClick={togglePlay}
@@ -412,6 +472,88 @@ export const WatcherView = ({
                 <p className="text-sm font-bold text-white mt-0.5">{metrics.activeChildren} children</p>
               </div>
             </div>
+
+            {/* Deep Technical Diagnostics */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
+                <span className="text-[10px] text-[#A1A1AA] uppercase">Chunks In / Fwd</span>
+                <p className="text-sm font-bold text-white mt-0.5">
+                  {metrics.chunksReceived || 0} / {metrics.chunksForwarded || 0}
+                </p>
+              </div>
+              <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
+                <span className="text-[10px] text-[#A1A1AA] uppercase">Last Packet Age</span>
+                <p className="text-sm font-bold text-white mt-0.5">
+                  {metrics.lastPacketAtAgeMs != null ? `${metrics.lastPacketAtAgeMs} ms` : 'N/A'}
+                </p>
+              </div>
+              <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
+                <span className="text-[10px] text-[#A1A1AA] uppercase">Decoder State</span>
+                <p className={`text-sm font-bold mt-0.5 ${metrics.waitingForKeyframe ? 'text-neon-rose' : 'text-cerulean-bright'}`}>
+                  {metrics.waitingForKeyframe ? 'Awaiting Keyframe' : 'Synced'}
+                </p>
+              </div>
+              <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
+                <span className="text-[10px] text-[#A1A1AA] uppercase">Gaps Skipped</span>
+                <p className="text-sm font-bold text-white mt-0.5">{metrics.gapsSkipped || 0}</p>
+              </div>
+            </div>
+
+            <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] flex items-center justify-between">
+              <span className="text-[10px] text-[#A1A1AA] uppercase">ICE Transport Candidate</span>
+              <span className="text-xs font-mono text-cerulean-bright font-bold">
+                {metrics.selectedCandidateType || 'unknown'}
+              </span>
+            </div>
+
+            {/* ?debug=1 — detailed ICE candidate type per link */}
+            {debugMode && (
+              <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] space-y-2">
+                <span className="text-[10px] text-[#A1A1AA] uppercase font-bold">Debug: ICE Candidate Types</span>
+                <div className="space-y-1">
+                  {metrics.parentPeerId && (
+                    <div className="flex items-center justify-between text-[11px] py-0.5">
+                      <span className="text-white font-mono">↑ Parent {metrics.parentPeerId.slice(-8)}</span>
+                      <span className="text-cerulean-bright font-bold">{metrics.selectedCandidateType || '?'}</span>
+                    </div>
+                  )}
+                  {metrics.childLinks && metrics.childLinks.map((child, idx) => (
+                    <div key={`ice-${idx}`} className="flex items-center justify-between text-[11px] py-0.5">
+                      <span className="text-white font-mono">↓ Child {child.peerId.slice(-8)}</span>
+                      <span className="text-cerulean-bright font-bold">{child.candidateType || '?'}</span>
+                    </div>
+                  ))}
+                  {(!metrics.parentPeerId && (!metrics.childLinks || metrics.childLinks.length === 0)) && (
+                    <span className="text-[#A1A1AA] text-[10px]">No active links</span>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Downstream Children Diagnostics */}
+            {metrics.childLinks && metrics.childLinks.length > 0 && (
+              <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] space-y-2">
+                <span className="text-[10px] text-[#A1A1AA] uppercase font-bold">Connected Downstream Peers</span>
+                <div className="space-y-1.5">
+                  {metrics.childLinks.map((child, idx) => (
+                    <div key={idx} className="flex items-center justify-between text-[11px] py-1 border-b border-[#29292F]/40 last:border-0">
+                      <span className="font-mono text-white">Peer {child.peerId.slice(-8)}</span>
+                      <div className="flex items-center gap-3">
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${child.open ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+                          {child.open ? 'OPEN' : 'CONNECTING'}
+                        </span>
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${child.hasSynced ? 'bg-cerulean/20 text-cerulean-bright' : 'bg-zinc-700 text-zinc-300'}`}>
+                          {child.hasSynced ? 'SYNCED' : 'SYNCING'}
+                        </span>
+                        <span className="text-[#A1A1AA] text-[10px]">
+                          Q: {child.queuedPackets}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {metrics.fingerprint && (
               <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] space-y-1">

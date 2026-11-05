@@ -43,12 +43,19 @@ export function getSupportedMimeType({ hasAudio = true } = {}) {
   return '';
 }
 
+export const KEYFRAME_EPOCH_MS =
+  (typeof import.meta !== 'undefined' && import.meta.env?.VITE_KEYFRAME_EPOCH_MS)
+    ? Number(import.meta.env.VITE_KEYFRAME_EPOCH_MS)
+    : 8000;
+
 export class StreamCapture {
-  constructor({ onChunk, onError, onStop, onSourceReverted } = {}) {
+  constructor({ onChunk, onError, onStop, onSourceReverted, keyframeEpochMs = KEYFRAME_EPOCH_MS } = {}) {
     this.onChunk = onChunk; // (chunkObject) => void
     this.onError = onError;
     this.onStop = onStop;
     this.onSourceReverted = onSourceReverted; // (newType, newStream) => void
+    this.keyframeEpochMs = keyframeEpochMs;
+    this.epochInterval = null;
 
     this.mediaStream = null;
     this.mediaRecorder = null;
@@ -68,25 +75,48 @@ export class StreamCapture {
     this.fallbackDrawTimer = null;
     this.fallbackCanvas = null;
     this.recorderGeneration = 0;
+    this.audioContext = null;
+    this._audioNodes = [];
+    this._audioStreams = [];
+    this.screenGain = null;
+    this.micGain = null;
+    this.audioAnalyser = null;
+    this.hasSystemAudio = false;
   }
 
   /**
    * Starts capturing camera & microphone.
    */
-  async startCamera({ video = true, audio = true, resolution = '720p' } = {}) {
+  async startCamera({ video = true, audio = true, resolution = '720p', deviceId = null } = {}) {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error('Camera/Microphone capture is not supported in this browser');
     }
 
     const is540p = resolution === '540p';
+    let videoConstraint = video
+      ? {
+          width: is540p ? { ideal: 960, max: 960 } : { ideal: 1280, max: 1280 },
+          height: is540p ? { ideal: 540, max: 540 } : { ideal: 720, max: 720 },
+          frameRate: { ideal: 30, max: 30 },
+        }
+      : false;
+
+    if (deviceId && videoConstraint) {
+      videoConstraint.deviceId = { ideal: deviceId };
+    } else if (video && navigator.mediaDevices?.enumerateDevices) {
+      // Prefer standard RGB color webcams over Windows Hello / IR sensor devices
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter((d) => d.kind === 'videoinput');
+        const rgbCamera = videoDevices.find((d) => d.label && !/ir\b|infrared/i.test(d.label));
+        if (rgbCamera && rgbCamera.deviceId) {
+          videoConstraint.deviceId = { ideal: rgbCamera.deviceId };
+        }
+      } catch (_) {}
+    }
+
     const constraints = {
-      video: video
-        ? {
-            width: is540p ? { ideal: 960, max: 960 } : { ideal: 1280, max: 1280 },
-            height: is540p ? { ideal: 540, max: 540 } : { ideal: 720, max: 720 },
-            frameRate: { ideal: 30, max: 30 },
-          }
-        : false,
+      video: videoConstraint,
       audio: audio
         ? {
             echoCancellation: true,
@@ -122,6 +152,137 @@ export class StreamCapture {
   }
 
   /**
+   * Mixes system/screen audio (e.g. YouTube video playback) and optional microphone audio.
+   * Holds strong references to all Web Audio API nodes on the instance to prevent Chromium V8
+   * garbage collection from silencing audio streams.
+   */
+  async mixScreenAndMicAudio(screenStream, withMic = true) {
+    const screenAudioTracks = screenStream.getAudioTracks();
+    this.hasSystemAudio = screenAudioTracks.length > 0;
+    console.log(`[Capture] Screen capture audio tracks: ${screenAudioTracks.length} (System sound: ${this.hasSystemAudio ? 'ACTIVE' : 'NONE'})`);
+
+    this.cleanupAudioGraph();
+
+    if (!this.hasSystemAudio && !withMic) {
+      return screenStream;
+    }
+
+    const AudioCtx = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext);
+    if (!AudioCtx) {
+      return screenStream;
+    }
+
+    try {
+      this.audioContext = new AudioCtx({ latencyHint: 'interactive' });
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume();
+      }
+
+      const dest = this.audioContext.createMediaStreamDestination();
+      this._audioNodes = [dest];
+      this._audioStreams = [];
+
+      // 1. YouTube / System screen audio pass-through with dedicated volume and analyser
+      if (this.hasSystemAudio) {
+        const screenAudioStream = new MediaStream(screenAudioTracks);
+        this._audioStreams.push(screenAudioStream);
+        const screenSource = this.audioContext.createMediaStreamSource(screenAudioStream);
+        this.screenGain = this.audioContext.createGain();
+        this.screenGain.gain.value = 1.0;
+        screenSource.connect(this.screenGain);
+        this.screenGain.connect(dest);
+
+        try {
+          this.audioAnalyser = this.audioContext.createAnalyser();
+          this.audioAnalyser.fftSize = 64;
+          this.screenGain.connect(this.audioAnalyser);
+          this._audioNodes.push(this.audioAnalyser);
+        } catch (_) {}
+
+        this._audioNodes.push(screenSource, this.screenGain);
+      }
+
+      // 2. Microphone audio input (optional commentary)
+      if (withMic && navigator.mediaDevices?.getUserMedia) {
+        try {
+          const micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+          if (micStream.getAudioTracks().length > 0) {
+            this._audioStreams.push(micStream);
+            const micSource = this.audioContext.createMediaStreamSource(micStream);
+            this.micGain = this.audioContext.createGain();
+            this.micGain.gain.value = 0.9;
+            micSource.connect(this.micGain);
+            this.micGain.connect(dest);
+            this._audioNodes.push(micSource, this.micGain);
+          }
+        } catch (micErr) {
+          console.warn('[Capture] Could not capture microphone for screen mix:', micErr.message);
+        }
+      }
+
+      const mixedAudioTracks = dest.stream.getAudioTracks();
+      if (mixedAudioTracks.length > 0) {
+        return new MediaStream([
+          ...screenStream.getVideoTracks(),
+          ...mixedAudioTracks,
+        ]);
+      }
+    } catch (err) {
+      console.warn('[Capture] Web Audio API mixing error, falling back to raw screen stream:', err);
+    }
+
+    return screenStream;
+  }
+
+  cleanupAudioGraph() {
+    if (this._audioNodes && this._audioNodes.length > 0) {
+      this._audioNodes.forEach((node) => {
+        try {
+          if (node.disconnect) node.disconnect();
+        } catch (_) {}
+      });
+      this._audioNodes = [];
+    }
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      try {
+        this.audioContext.close();
+      } catch (_) {}
+      this.audioContext = null;
+    }
+    this._audioStreams = [];
+    this.screenGain = null;
+    this.micGain = null;
+    this.audioAnalyser = null;
+  }
+
+  setMicMuted(muted) {
+    if (this.micGain) {
+      this.micGain.gain.value = muted ? 0 : 0.9;
+    }
+  }
+
+  getAudioLevel() {
+    if (!this.audioAnalyser) return 0;
+    try {
+      const data = new Uint8Array(this.audioAnalyser.frequencyBinCount);
+      this.audioAnalyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        sum += data[i];
+      }
+      return sum / (data.length * 255);
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /**
    * Starts capturing screen with optional microphone mix.
    */
   async startScreen({ withMic = true } = {}) {
@@ -129,49 +290,34 @@ export class StreamCapture {
       throw new Error('Screen sharing is not supported in this browser');
     }
 
-    const screenStream = await navigator.mediaDevices.getDisplayMedia({
+    const displayOptions = {
       video: {
         cursor: 'always',
         frameRate: { ideal: 30, max: 30 },
       },
-      audio: true, // system/tab audio
-    });
+      audio: {
+        suppressLocalAudioPlayback: false,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+      systemAudio: 'include',
+      selfBrowserSurface: 'include',
+      surfaceSwitching: 'include',
+    };
 
-    let finalStream = screenStream;
-
-    // If user also wants mic audio mixed into the screen broadcast
-    if (withMic && navigator.mediaDevices.getUserMedia) {
-      try {
-        const micStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true },
-        });
-
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (AudioCtx) {
-          this.audioContext = new AudioCtx();
-          if (this.audioContext.state === 'suspended') {
-            await this.audioContext.resume();
-          }
-          const dest = this.audioContext.createMediaStreamDestination();
-
-          if (screenStream.getAudioTracks().length > 0) {
-            const screenSource = this.audioContext.createMediaStreamSource(screenStream);
-            screenSource.connect(dest);
-          }
-
-          const micSource = this.audioContext.createMediaStreamSource(micStream);
-          micSource.connect(dest);
-
-          finalStream = new MediaStream([
-            ...screenStream.getVideoTracks(),
-            ...dest.stream.getAudioTracks(),
-          ]);
-        }
-      } catch (e) {
-        console.warn('[Capture] Could not capture microphone for screen mix:', e.message);
-      }
+    let screenStream;
+    try {
+      screenStream = await navigator.mediaDevices.getDisplayMedia(displayOptions);
+    } catch (_) {
+      // Fallback for browsers that don't support extended systemAudio constraints
+      screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: 'always', frameRate: { ideal: 30, max: 30 } },
+        audio: true,
+      });
     }
 
+    const finalStream = await this.mixScreenAndMicAudio(screenStream, withMic);
     this.mediaStream = finalStream;
     this.attachTrackListeners(finalStream, 'screen');
     this.currentSourceType = 'screen';
@@ -344,8 +490,8 @@ export class StreamCapture {
    * Dynamic live source switching (Camera ↔ Screen Share) during a live broadcast.
    * Preserves continuous sequence numbering and session continuity.
    */
-  async switchSource({ type = 'camera', withMic = true } = {}) {
-    if (type === this.currentSourceType && this.mediaStream && this.isRecording) {
+  async switchSource({ type = 'camera', withMic = true, deviceId = null, forceReselect = false } = {}) {
+    if (!forceReselect && type === this.currentSourceType && this.mediaStream && this.isRecording && !deviceId) {
       return { stream: this.mediaStream, type };
     }
 
@@ -357,10 +503,26 @@ export class StreamCapture {
         throw new Error('Screen sharing is not supported in this browser');
       }
       try {
-        newStream = await navigator.mediaDevices.getDisplayMedia({
+        const displayOptions = {
           video: { cursor: 'always', frameRate: { ideal: 30, max: 30 } },
-          audio: true,
-        });
+          audio: {
+            suppressLocalAudioPlayback: false,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+          systemAudio: 'include',
+          selfBrowserSurface: 'include',
+          surfaceSwitching: 'include',
+        };
+        try {
+          newStream = await navigator.mediaDevices.getDisplayMedia(displayOptions);
+        } catch (_) {
+          newStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { cursor: 'always', frameRate: { ideal: 30, max: 30 } },
+            audio: true,
+          });
+        }
       } catch (err) {
         if (err.name === 'NotAllowedError') {
           console.log('[Capture] User cancelled screen picker dialog; active stream remains unchanged.');
@@ -369,41 +531,28 @@ export class StreamCapture {
         throw err;
       }
 
-      // Mix mic if requested
-      if (withMic && navigator.mediaDevices.getUserMedia) {
-        try {
-          const micStream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: true, noiseSuppression: true },
-          });
-          const AudioCtx = window.AudioContext || window.webkitAudioContext;
-          if (AudioCtx) {
-            if (this.audioContext) {
-              try { this.audioContext.close(); } catch (_) {}
-            }
-            this.audioContext = new AudioCtx();
-            if (this.audioContext.state === 'suspended') {
-              await this.audioContext.resume();
-            }
-            const dest = this.audioContext.createMediaStreamDestination();
-            if (newStream.getAudioTracks().length > 0) {
-              const screenSource = this.audioContext.createMediaStreamSource(newStream);
-              screenSource.connect(dest);
-            }
-            const micSource = this.audioContext.createMediaStreamSource(micStream);
-            micSource.connect(dest);
-            newStream = new MediaStream([
-              ...newStream.getVideoTracks(),
-              ...dest.stream.getAudioTracks(),
-            ]);
-          }
-        } catch (_) {}
-      }
+      newStream = await this.mixScreenAndMicAudio(newStream, withMic);
     } else {
-      // Switch back to Camera
-      newStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 }, frameRate: { ideal: 30, max: 30 } },
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      // Switch back to Camera (or switch camera device)
+      const videoConfig = {
+        width: { ideal: 1280, max: 1920 },
+        height: { ideal: 720, max: 1080 },
+        frameRate: { ideal: 30, max: 30 },
+      };
+      if (deviceId) {
+        videoConfig.deviceId = { ideal: deviceId };
+      }
+      try {
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: videoConfig,
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      } catch (_) {
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: Boolean(deviceId ? { deviceId: { ideal: deviceId } } : true),
+          audio: { echoCancellation: true, noiseSuppression: true },
+        });
+      }
     }
 
     this.isSwitchingSource = true;
@@ -496,20 +645,83 @@ export class StreamCapture {
           return;
         }
 
-        const isInitChunk = this.isFirstChunkOfRecorder;
-        this.isFirstChunkOfRecorder = false;
+        if (this.isFirstChunkOfRecorder) {
+          this.isFirstChunkOfRecorder = false;
 
-        // The first emitted chunk of the recorder contains the initialization segment
-        if (isInitChunk) {
-          this.initSegment = payloadBytes;
+          // Split the very first recorder burst into:
+          // 1. Pure EBML container init segment (0 to clusterIdx)
+          // 2. First Matroska Cluster with initial VP8/H.264 keyframe (clusterIdx to end)
+          let clusterIdx = -1;
+          for (let i = 0; i < payloadBytes.length - 4; i++) {
+            if (
+              payloadBytes[i] === 0x1f &&
+              payloadBytes[i + 1] === 0x43 &&
+              payloadBytes[i + 2] === 0xb6 &&
+              payloadBytes[i + 3] === 0x75
+            ) {
+              clusterIdx = i;
+              break;
+            }
+          }
+
+          if (clusterIdx > 0) {
+            const initHeader = payloadBytes.slice(0, clusterIdx);
+            const firstCluster = payloadBytes.slice(clusterIdx);
+
+            this.initSegment = initHeader;
+
+            // Emit Init Segment (seq 0)
+            const initChunk = {
+              sequence: this.sequence,
+              timestamp: Date.now(),
+              isInit: true,
+              isKeyframe: false,
+              payload: initHeader,
+              mimeType: this.mimeType,
+            };
+            this.sequence++;
+            if (this.onChunk) {
+              this.onChunk(initChunk);
+            }
+
+            // Emit First Keyframe Chunk (seq 1)
+            const keyframeChunk = {
+              sequence: this.sequence,
+              timestamp: Date.now(),
+              isInit: false,
+              isKeyframe: true,
+              payload: firstCluster,
+              mimeType: this.mimeType,
+            };
+            this.sequence++;
+            if (this.onChunk) {
+              this.onChunk(keyframeChunk);
+            }
+            return;
+          } else {
+            // Fallback if no cluster found in first burst
+            this.initSegment = payloadBytes;
+            this.isNextChunkKeyframe = true;
+            const initChunk = {
+              sequence: this.sequence,
+              timestamp: Date.now(),
+              isInit: true,
+              isKeyframe: false,
+              payload: payloadBytes,
+              mimeType: this.mimeType,
+            };
+            this.sequence++;
+            if (this.onChunk) {
+              this.onChunk(initChunk);
+            }
+            return;
+          }
         }
 
         let isKeyframe = false;
-        if (isInitChunk) {
-          isKeyframe = false; // EBML container header is an init segment, not a video keyframe
-        } else if (this.isSecondChunkOfNewSource || this.sequence === 1) {
-          // The first video chunk following container header is always an independent keyframe
+        if (this.isNextChunkKeyframe || this.isSecondChunkOfNewSource || this.sequence === 1) {
           isKeyframe = true;
+          this.isNextChunkKeyframe = false;
           this.isSecondChunkOfNewSource = false;
         } else {
           isKeyframe = this.probeKeyframe(payloadBytes);
@@ -518,7 +730,7 @@ export class StreamCapture {
         const chunkObj = {
           sequence: this.sequence,
           timestamp: Date.now(),
-          isInit: isInitChunk,
+          isInit: false,
           isKeyframe,
           payload: payloadBytes,
           mimeType: this.mimeType,
@@ -548,9 +760,13 @@ export class StreamCapture {
       }
     };
 
-    // Start recording in ~500 ms chunks
+    // Start recording in ~300 ms chunks
     this.mediaRecorder.start(this.timesliceMs);
     this.isRecording = true;
+
+    if (!isSourceSwitch) {
+      this.startEpochTimer();
+    }
 
     return {
       stream: this.mediaStream,
@@ -558,17 +774,62 @@ export class StreamCapture {
     };
   }
 
+  startEpochTimer() {
+    this.stopEpochTimer();
+    this.epochInterval = setInterval(() => {
+      this.restartEpoch();
+    }, this.keyframeEpochMs);
+  }
+
+  stopEpochTimer() {
+    if (this.epochInterval) {
+      clearInterval(this.epochInterval);
+      this.epochInterval = null;
+    }
+  }
+
+  restartEpoch() {
+    if (!this.isRecording || this.isSwitchingSource || !this.mediaStream) return;
+    const tracks = this.mediaStream.getVideoTracks();
+    if (tracks.length === 0 || tracks[0].readyState !== 'live') return;
+    console.log(`[Capture] Starting fresh keyframe epoch (${this.keyframeEpochMs}ms elapsed)`);
+    this.isSwitchingSource = true;
+    if (this.mediaRecorder) {
+      this.mediaRecorder.ondataavailable = null;
+      this.mediaRecorder.onerror = null;
+      this.mediaRecorder.onstop = null;
+      if (this.mediaRecorder.state !== 'inactive') {
+        try { this.mediaRecorder.stop(); } catch (_) {}
+      }
+    }
+    // Do NOT stop tracks of this.mediaStream! Keep active captured tracks live.
+    this.stashedFirstChunk = null;
+    this.initRecorder(this.mediaStream, /* isSourceSwitch= */ true);
+    this.isSwitchingSource = false;
+  }
+
   /**
-   * Inspects bytes to accurately determine if chunk contains a VP8 video keyframe.
+   * Inspects bytes to accurately determine if chunk contains a VP8/H.264 video keyframe.
    * Matches the official VP8 uncompressed header start code (0x9D 0x01 0x2A) preceded by keyframe tag (bit 0 == 0).
    */
   probeKeyframe(bytes) {
     if (!bytes || bytes.length < 16) return false;
-
-    // Timeslice blobs are not guaranteed to begin at an EBML cluster
-    // boundary. The first media chunk of each recorder epoch is marked
-    // explicitly above; uncertain later blobs stay delta frames so bootstrap
-    // never starts from a false keyframe inside compressed data.
+    // Check for VP8 start code 0x9D 0x01 0x2A with bit 0 == 0
+    for (let i = 0; i < Math.min(bytes.length - 6, 256); i++) {
+      if (bytes[i + 3] === 0x9d && bytes[i + 4] === 0x01 && bytes[i + 5] === 0x2a) {
+        if ((bytes[i] & 0x01) === 0) {
+          return true;
+        }
+      }
+    }
+    // Check for H.264 NAL type 5 (IDR) or 7 (SPS)
+    for (let i = 0; i < Math.min(bytes.length - 5, 256); i++) {
+      if (bytes[i] === 0x00 && bytes[i + 1] === 0x00 && (bytes[i + 2] === 0x01 || (bytes[i + 2] === 0x00 && bytes[i + 3] === 0x01))) {
+        const nalIndex = bytes[i + 2] === 0x01 ? i + 3 : i + 4;
+        const nalType = bytes[nalIndex] & 0x1f;
+        if (nalType === 5 || nalType === 7) return true;
+      }
+    }
     return false;
   }
 
@@ -585,6 +846,7 @@ export class StreamCapture {
   }
 
   stop() {
+    this.stopEpochTimer();
     if (this.cameraRecoveryTimer) {
       clearTimeout(this.cameraRecoveryTimer);
       this.cameraRecoveryTimer = null;
@@ -600,15 +862,13 @@ export class StreamCapture {
   }
 
   cleanup() {
+    this.stopEpochTimer();
+    this.cleanupAudioGraph();
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((t) => {
         try { t.stop(); } catch (_) {}
       });
       this.mediaStream = null;
-    }
-    if (this.audioContext) {
-      try { this.audioContext.close(); } catch (_) {}
-      this.audioContext = null;
     }
     this.isRecording = false;
   }

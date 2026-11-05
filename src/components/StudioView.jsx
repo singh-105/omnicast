@@ -12,11 +12,14 @@ import {
   ChevronDown,
   ChevronUp,
   AlertTriangle,
+  AlertCircle,
   Clock,
   Layers,
   Activity,
   Zap,
   Globe,
+  Volume2,
+  RotateCcw,
 } from 'lucide-react';
 
 export const StudioView = ({
@@ -33,6 +36,62 @@ export const StudioView = ({
   const [isAudioMuted, setIsAudioMuted] = useState(false);
   const [durationSecs, setDurationSecs] = useState(0);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [localMetrics, setLocalMetrics] = useState(metrics || {});
+  const [availableCameras, setAvailableCameras] = useState([]);
+  const [selectedCameraId, setSelectedCameraId] = useState('');
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [hasScreenAudio, setHasScreenAudio] = useState(false);
+
+  // Monitor live screen audio levels and presence
+  useEffect(() => {
+    if (!isLive || !broadcastManager) return;
+    const interval = setInterval(() => {
+      const level = broadcastManager.getAudioLevel ? broadcastManager.getAudioLevel() : 0;
+      setAudioLevel(level);
+      setHasScreenAudio(broadcastManager.hasSystemAudio ? broadcastManager.hasSystemAudio() : false);
+    }, 100);
+    return () => clearInterval(interval);
+  }, [isLive, broadcastManager]);
+
+  // Discover and enumerate available cameras
+  useEffect(() => {
+    async function loadCameras() {
+      if (navigator.mediaDevices?.enumerateDevices) {
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const videoInputs = devices.filter((d) => d.kind === 'videoinput');
+          setAvailableCameras(videoInputs);
+          if (videoInputs.length > 0 && !selectedCameraId) {
+            // Prioritize standard color webcams over Windows Hello IR sensors
+            const nonIr = videoInputs.find((d) => d.label && !/ir\b|infrared/i.test(d.label));
+            setSelectedCameraId(nonIr ? nonIr.deviceId : videoInputs[0].deviceId);
+          }
+        } catch (_) {}
+      }
+    }
+    loadCameras();
+    if (navigator.mediaDevices) {
+      navigator.mediaDevices.addEventListener('devicechange', loadCameras);
+      return () => navigator.mediaDevices.removeEventListener('devicechange', loadCameras);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!broadcastManager) return;
+    const orig = broadcastManager.onMetrics;
+    broadcastManager.onMetrics = (m) => {
+      if (orig) orig(m);
+      setLocalMetrics({ ...m });
+    };
+    return () => {
+      broadcastManager.onMetrics = orig;
+    };
+  }, [broadcastManager]);
+
+  const displayMetrics = { ...metrics, ...localMetrics, ...(broadcastManager?.metrics || {}) };
+
+  const urlParams = new URLSearchParams(typeof window !== 'undefined' ? window.location.search : '');
+  const maxChildren = parseInt(urlParams.get('maxChildren') || '5', 10);
 
   const localVideoRef = useRef(null);
 
@@ -85,12 +144,34 @@ export const StudioView = ({
         title: streamTitle,
         type: streamType,
         maxChildren,
+        deviceId: streamType === 'camera' ? selectedCameraId : null,
       });
       setActiveStream(res.stream);
       setIsLive(true);
+      // Re-enumerate to get fresh device labels once permission is active
+      if (navigator.mediaDevices?.enumerateDevices) {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoInputs = devices.filter((d) => d.kind === 'videoinput');
+        setAvailableCameras(videoInputs);
+      }
     } catch (err) {
       console.error('[Studio] Start broadcast error:', err);
       setErrorMsg(err.message || 'Failed to start broadcast');
+    }
+  };
+
+  const handleCameraChange = async (newDeviceId) => {
+    setSelectedCameraId(newDeviceId);
+    if (isLive && streamType === 'camera') {
+      try {
+        const res = await broadcastManager.switchSource({ type: 'camera', deviceId: newDeviceId });
+        if (res?.stream) {
+          setActiveStream(res.stream);
+        }
+      } catch (err) {
+        console.warn('[Studio] Camera switch error:', err);
+        setErrorMsg(`Failed to switch camera: ${err.message}`);
+      }
     }
   };
 
@@ -108,13 +189,17 @@ export const StudioView = ({
     setIsLive(false);
   };
 
-  const handleSwitchSource = async (newType) => {
-    if (newType === streamType) return;
+  const handleSwitchSource = async (newType, forceReselect = false) => {
+    if (newType === streamType && !forceReselect) return;
     setErrorMsg('');
 
     if (isLive) {
       try {
-        const res = await broadcastManager.switchSource({ type: newType });
+        const res = await broadcastManager.switchSource({
+          type: newType,
+          deviceId: newType === 'camera' ? selectedCameraId : null,
+          forceReselect,
+        });
         if (res) {
           setStreamType(res.type);
           setActiveStream(res.stream);
@@ -129,11 +214,15 @@ export const StudioView = ({
   };
 
   const toggleAudio = () => {
-    if (activeStream) {
+    const nextMuted = !isAudioMuted;
+    setIsAudioMuted(nextMuted);
+    if (broadcastManager) {
+      broadcastManager.setMicMuted(nextMuted);
+    }
+    if (streamType === 'camera' && activeStream) {
       activeStream.getAudioTracks().forEach((track) => {
-        track.enabled = !track.enabled;
+        track.enabled = !nextMuted;
       });
-      setIsAudioMuted(!isAudioMuted);
     }
   };
 
@@ -264,6 +353,21 @@ export const StudioView = ({
                 <span>Camera</span>
               </button>
 
+              {streamType === 'camera' && availableCameras.length > 1 && (
+                <select
+                  value={selectedCameraId}
+                  onChange={(e) => handleCameraChange(e.target.value)}
+                  className="px-2.5 py-1.5 rounded-lg text-xs font-mono bg-[#1E1E26] text-white border border-[#29292F] focus:border-cerulean outline-none cursor-pointer max-w-[200px] truncate"
+                  title="Select Camera Device"
+                >
+                  {availableCameras.map((cam, idx) => (
+                    <option key={cam.deviceId || idx} value={cam.deviceId}>
+                      {cam.label || `Camera ${idx + 1}`}
+                    </option>
+                  ))}
+                </select>
+              )}
+
               <button
                 type="button"
                 onClick={() => handleSwitchSource('screen')}
@@ -278,8 +382,8 @@ export const StudioView = ({
               </button>
             </div>
 
-            {/* Mic Toggle */}
-            <div className="flex items-center gap-3">
+            {/* Audio Controls */}
+            <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={toggleAudio}
@@ -292,8 +396,62 @@ export const StudioView = ({
                 {isAudioMuted ? <MicOff className="w-3.5 h-3.5 text-neon-rose" /> : <Mic className="w-3.5 h-3.5 text-cerulean-bright" />}
                 <span>{isAudioMuted ? 'Mic Muted' : 'Mic Active'}</span>
               </button>
+
+              {streamType === 'screen' && (
+                <div
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-mono flex items-center gap-1.5 border transition-all ${
+                    hasScreenAudio
+                      ? 'bg-cerulean/15 border-cerulean text-cerulean-bright'
+                      : 'bg-neon-rose/15 border-neon-rose text-neon-rose'
+                  }`}
+                  title={hasScreenAudio ? 'YouTube/system audio is active and streaming' : 'No screen audio track captured'}
+                >
+                  <Volume2 className="w-3.5 h-3.5" />
+                  <span>{hasScreenAudio ? 'Tab Audio Active' : 'No Tab Audio'}</span>
+                </div>
+              )}
             </div>
           </div>
+
+          {streamType === 'screen' && (
+            <div className="space-y-2">
+              {hasScreenAudio ? (
+                <div className="px-4 py-2.5 rounded-xl bg-[#141418] border border-cerulean/30 flex items-center justify-between text-xs font-mono">
+                  <div className="flex items-center gap-2 text-cerulean-bright font-bold">
+                    <span className="w-2 h-2 rounded-full bg-cerulean-bright animate-ping" />
+                    <span>Streaming YouTube / Tab Audio Live</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] text-[#A1A1AA] uppercase">Volume Level:</span>
+                    <div className="w-24 h-2 bg-[#0A0A0A] rounded-full overflow-hidden border border-[#29292F]">
+                      <div
+                        className="h-full bg-cerulean-bright transition-all duration-75"
+                        style={{ width: `${Math.min(100, Math.max(6, audioLevel * 300))}%` }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-3.5 rounded-xl bg-neon-rose/10 border border-neon-rose/30 space-y-2 text-xs font-mono">
+                  <div className="flex items-start gap-2 text-neon-rose font-bold">
+                    <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>YouTube / Tab Audio Not Captured! Viewers will not hear video voice.</span>
+                  </div>
+                  <p className="text-[11px] text-[#A1A1AA] leading-relaxed">
+                    When sharing a YouTube video in Google Chrome: Click <strong className="text-white">Chrome Tab</strong> and ensure <strong className="text-white">&ldquo;Share tab audio&rdquo;</strong> is enabled at the bottom.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => handleSwitchSource('screen', true)}
+                    className="px-3 py-1.5 rounded-lg bg-neon-rose/20 hover:bg-neon-rose/30 border border-neon-rose/50 text-neon-rose font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Re-select YouTube Tab with Audio</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Right Column: Broadcast Controls & Share Link */}
@@ -342,7 +500,7 @@ export const StudioView = ({
                 </span>
                 <span className="text-xs font-mono text-neon-rose font-bold flex items-center gap-1">
                   <Users className="w-3.5 h-3.5" />
-                  {metrics.viewerCount || 0} Viewers
+                  {displayMetrics.viewerCount || 0} Viewers
                 </span>
               </div>
 
@@ -350,7 +508,7 @@ export const StudioView = ({
                 <div className="p-3 rounded-xl bg-cerulean/10 border border-cerulean/20 text-[11px] font-mono text-cerulean-bright flex items-start gap-2">
                   <Globe className="w-4 h-4 shrink-0 mt-0.5 text-cerulean-bright" />
                   <span className="leading-relaxed">
-                    Local Network Link · Viewers on this computer or LAN can join. For internet audiences, share from your public domain or tunnel.
+                    Local Network Link · Audience on this computer or LAN can join. For internet audiences, share from your public domain or tunnel.
                   </span>
                 </div>
               )}
@@ -378,11 +536,11 @@ export const StudioView = ({
             <div className="grid grid-cols-2 gap-3 text-xs font-mono">
               <div className="p-3.5 rounded-xl border border-[#29292F] bg-[#141418] space-y-1">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Audience</span>
-                <p className="text-base font-bold text-white">{metrics.viewerCount || 0} watching</p>
+                <p className="text-base font-bold text-white">{displayMetrics.viewerCount || 0} watching</p>
               </div>
               <div className="p-3.5 rounded-xl border border-[#29292F] bg-[#141418] space-y-1">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Direct Children</span>
-                <p className="text-base font-bold text-cerulean-bright">{metrics.activeChildren} / 5 max</p>
+                <p className="text-base font-bold text-cerulean-bright">{displayMetrics.activeChildren || 0} / {maxChildren} max</p>
               </div>
             </div>
           )}
@@ -408,29 +566,29 @@ export const StudioView = ({
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                   <span className="text-[10px] text-[#A1A1AA] uppercase">Upload Rate</span>
-                  <p className="text-sm font-bold text-cerulean-bright mt-0.5">{metrics.bitrateKbps} kbps</p>
+                  <p className="text-sm font-bold text-cerulean-bright mt-0.5">{displayMetrics.bitrateKbps || 0} kbps</p>
                 </div>
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                   <span className="text-[10px] text-[#A1A1AA] uppercase">Emitted Chunks</span>
-                  <p className="text-sm font-bold text-white mt-0.5">{metrics.chunksEmitted}</p>
+                  <p className="text-sm font-bold text-white mt-0.5">{displayMetrics.chunksEmitted || 0}</p>
                 </div>
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                   <span className="text-[10px] text-[#A1A1AA] uppercase">Bytes Out</span>
-                  <p className="text-sm font-bold text-white mt-0.5">{(metrics.bytesSent / 1024).toFixed(1)} KB</p>
+                  <p className="text-sm font-bold text-white mt-0.5">{((displayMetrics.bytesSent || 0) / 1024).toFixed(1)} KB</p>
                 </div>
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                   <span className="text-[10px] text-[#A1A1AA] uppercase">Mesh Fanout</span>
-                  <p className="text-sm font-bold text-white mt-0.5">{metrics.activeChildren} Tier-1 Nodes</p>
+                  <p className="text-sm font-bold text-white mt-0.5">{displayMetrics.activeChildren || 0} Tier-1 Nodes</p>
                 </div>
               </div>
 
-              {metrics.fingerprint && (
+              {(displayMetrics.fingerprint || broadcastManager.originFingerprint) && (
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] space-y-1">
                   <div className="flex items-center gap-1.5 text-cerulean-bright">
                     <ShieldCheck className="w-3.5 h-3.5" />
                     <span className="font-bold text-[10px] uppercase">ECDSA P-256 Origin Fingerprint</span>
                   </div>
-                  <p className="text-[11px] text-[#A1A1AA] break-all select-all">{metrics.fingerprint}</p>
+                  <p className="text-[11px] text-[#A1A1AA] break-all select-all">{displayMetrics.fingerprint || broadcastManager.originFingerprint}</p>
                 </div>
               )}
             </div>

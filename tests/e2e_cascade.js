@@ -157,15 +157,27 @@ async function runCascadeE2ETest() {
     //         Viewer C must detect disconnection and recover.
     // ══════════════════════════════════════════════════════════════════════
     console.log('\n⚡ STEP 4: Disconnecting Relay Viewer B -> Verifying Failover Recovery on Viewer C...');
+    const cTimeBefore = await viewerCPage.evaluate(() => document.querySelector('video')?.currentTime || 0);
+    console.log(`   Viewer C currentTime before killing B: ${cTimeBefore.toFixed(2)}s`);
+
     await viewerBPage.close();
     await viewerBContext.close();
     console.log('   💥 Viewer B abruptly terminated (simulating tab close / power loss)');
 
-    // Allow failover trigger to detect closed DataChannel and send broadcast:join or switch
-    await new Promise((r) => setTimeout(r, 2000));
+    // Allow failover trigger to detect closed DataChannel, reconnect to origin/standby, and resume
+    await viewerCPage.waitForFunction(
+      (baseTime) => {
+        const v = document.querySelector('video');
+        return v && !v.paused && v.currentTime >= baseTime + 1.0;
+      },
+      cTimeBefore,
+      { timeout: 15000 }
+    );
 
-    // Verify Viewer C recovers connection
-    console.log('   ✅ Failover event triggered and handled cleanly on Viewer C');
+    const cTimeAfter = await viewerCPage.evaluate(() => document.querySelector('video')?.currentTime || 0);
+    console.log(`   Viewer C currentTime after failover recovery: ${cTimeAfter.toFixed(2)}s (advance: ${(cTimeAfter - cTimeBefore).toFixed(2)}s)`);
+    assert(cTimeAfter >= cTimeBefore + 1.0, 'Viewer C must advance >= 1.0s after failover recovery');
+    console.log('   ✅ Failover event triggered and handled cleanly on Viewer C; playback resumed!');
 
     // ══════════════════════════════════════════════════════════════════════
     // STEP 5: Teardown

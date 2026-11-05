@@ -1,43 +1,41 @@
 /**
  * OmniCast Client Broadcast & Relay Manager
  *
- * Orchestrates:
- * 1. WebRTC signaling via central WebSocket (zero media on WS!).
- * 2. Origin media capture, ECDSA P-256 signing, and multi-child distribution.
- * 3. Viewer receiving, ECDSA verification, MSE rendering, and downstream forwarding.
- * 4. Tree-mesh cascade with 5-child fanout bound.
- * 5. Standby parent management and sub-400ms automatic failover.
- * 6. Live telemetry and real-time performance instrumentation.
+ * Implements:
+ * - PeerLink native WebRTC DataChannel transport (strictly zero centralized media forwarding).
+ * - Multi-tier tree-mesh forwarding (Origin -> Tier 1 Relays -> Tier 2 Relays -> Leaf Viewers).
+ * - Periodic keyframe epochs (MediaRecorder clean EBML init headers every 8s).
+ * - Non-contiguous ring buffer retention ensuring late joiners and downstream relays get clean stream bootstrapping.
+ * - Outgoing DataChannel backpressure management with chunk-level sequence dropping.
+ * - SourceBuffer QuotaExceeded eviction and keyframe stall recovery timeouts.
+ * - Exponential WebSocket backoff reconnection.
+ * - 15-second ICE connect timeout reporting to topology coordinator.
+ * - Origin ECDSA P-256 cryptographic authenticity verification.
  */
 
+import { generateBroadcasterKeyPair, signChunk, verifyChunk, exportPublicKeyInfo, importPublicKey } from './crypto/signatures.js';
 import { StreamCapture } from './capture/streamCapture.js';
-import { PeerLink, DEFAULT_RTC_CONFIG } from './transport/peerConnection.js';
 import { MsePlayer } from './playback/msePlayer.js';
+import { MediaRingBuffer } from './protocol/ringBuffer.js';
+import { SequenceReorderQueue } from './protocol/ringBuffer.js';
 import {
+  fragmentChunk,
   PacketType,
   PacketFlags,
-  fragmentChunk,
   deserializePacket,
   PacketReassembler,
 } from './protocol/framing.js';
-import { MediaRingBuffer, SequenceReorderQueue } from './protocol/ringBuffer.js';
-import {
-  generateBroadcasterKeyPair,
-  exportPublicKeyInfo,
-  importPublicKey,
-  signChunk,
-  verifyChunk,
-} from './crypto/signatures.js';
+import { PeerLink } from './transport/peerConnection.js';
 
 export class BroadcastManager {
   constructor({
-    signalingUrl,
-    onStateChange,
-    onMetrics,
-    onError,
-    onStreamChanged,
-    onBroadcastAnnounced,
-    onBroadcastEnded,
+    signalingUrl = null,
+    onStateChange = null,
+    onMetrics = null,
+    onError = null,
+    onStreamChanged = null,
+    onBroadcastAnnounced = null,
+    onBroadcastEnded = null,
   } = {}) {
     this.signalingUrl = signalingUrl || this.getDefaultSignalingUrl();
     this.onStateChange = onStateChange;
@@ -46,91 +44,117 @@ export class BroadcastManager {
     this.onStreamChanged = onStreamChanged;
     this.onBroadcastAnnounced = onBroadcastAnnounced;
     this.onBroadcastEnded = onBroadcastEnded;
-
-    this.localPeerId = 'peer-' + Math.random().toString(36).substring(2, 10);
-    this.role = 'idle'; // 'broadcaster' | 'viewer' | 'relay' | 'idle'
+    this.ws = null;
+    this.localPeerId = 'p' + Math.random().toString(36).substring(2, 9);
+    this.role = 'idle'; // 'idle' | 'broadcaster' | 'viewer'
     this.broadcastId = null;
-    this.streamTitle = '';
-    this.tier = 0;
+    this.tier = null;
+    this.destroyed = false;
+    this._reconnectAttempts = 0;
+    this._reconnectTimer = null;
+    this._lastRelayLog = 0;
 
-    // Cryptography
+    // Cryptographic Origin Identity (ECDSA P-256)
     this.keyPair = null;
     this.originPublicKey = null;
-    this.originFingerprint = '';
+    this.originFingerprint = null;
 
-    // Networking
-    this.ws = null;
-    this.pendingWsMessages = [];
+    // Media & Playback Subsystems
+    this.streamCapture = null;
+    this.msePlayer = null;
+    this.videoElement = null;
+    this.streamMimeType = 'video/webm; codecs="vp8,opus"';
+
+    // Bounded Ring Buffer & Sequence Control
+    this.ringBuffer = new MediaRingBuffer({ maxItems: 240, maxDurationMs: 30000 });
+    this.reassembler = new PacketReassembler(4000);
+    this.reorderQueue = null;
+
+    // WebRTC Peer Links (native RTCDataChannel)
+    this.parentLink = null;
     this.children = new Map(); // childPeerId -> PeerLink
-    this.parentLink = null;     // active upstream PeerLink
     this.standbyLinks = new Map(); // standbyPeerId -> PeerLink
     this.standbyCandidateIds = [];
 
-    // Media & Playback
-    this.streamCapture = null;
-    this.msePlayer = null;
-    this.streamMimeType = 'video/webm; codecs="vp8,opus"';
-    this.ringBuffer = new MediaRingBuffer({ maxItems: 240, maxDurationMs: 60000 });
-    this.reorderQueue = null;
-    this.reassembler = new PacketReassembler();
+    // Queue for processing
     this.originChunkQueue = [];
     this.isProcessingOriginChunks = false;
     this.incomingPacketQueue = [];
     this.isProcessingIncomingPackets = false;
+    this.lastInitSequence = null;
     this.upstreamWatchdogTimer = null;
     this.lastPacketAt = 0;
     this.bootstrapRetryCount = 0;
 
-    // Telemetry & Stats
+    // Metrics & Telemetry
     this.metrics = {
       role: 'idle',
       tier: null,
-      activeChildren: 0,
       parentPeerId: null,
+      activeChildren: 0,
+      viewerCount: 0,
+      bitrateKbps: 0,
       parentRtt: 0,
+      liveLatencyMs: 0,
       bytesReceived: 0,
       bytesSent: 0,
       chunksEmitted: 0,
       chunksReceived: 0,
       chunksForwarded: 0,
-      tamperedChunksDropped: 0,
       droppedChunks: 0,
+      tamperedChunksDropped: 0,
       failovers: 0,
-      viewerCount: 0,
-      bitrateKbps: 0,
-      liveLatencyMs: 0,
-      fingerprint: '',
+      captureFps: 0,
+      decodedFps: 0,
+      bufferDepthSecs: 0,
+      droppedFrames: 0,
+      totalFrames: 0,
+      fingerprint: null,
+      childLinks: [],
+      lastPacketAtAgeMs: null,
+      waitingForKeyframe: false,
+      gapsSkipped: 0,
+      selectedCandidateType: 'none',
     };
-
     this.metricsTimer = null;
     this.lastBytesReceived = 0;
     this.lastBytesSent = 0;
+
+    // State & Event Callbacks
+    this.onStateChange = null;
+    this.onLiveStateChange = null;
+    this.onError = null;
+    this.onBroadcastsList = null;
+    this.onBroadcastAnnounced = null;
+    this.onBroadcastEnded = null;
+    this.onMetrics = null;
+
+    this.pendingWsMessages = [];
   }
 
   getDefaultSignalingUrl() {
     if (typeof window === 'undefined') return 'ws://127.0.0.1:10000/signaling';
-
-    // 1. Explicit environment variable override
-    if (typeof import.meta !== 'undefined' && import.meta.env?.VITE_SIGNALING_URL) {
-      return import.meta.env.VITE_SIGNALING_URL;
-    }
-
-    // 2. Same-Origin WebSocket URL:
-    // Routes through Vite dev proxy (or production reverse proxy) on standard port
-    // Resolves both mixed-content HTTPS restrictions and public tunnel port-forwarding issues.
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${protocol}//${window.location.host}/signaling`;
   }
 
   /**
-   * Connect to the signaling server.
+   * Connect to the signaling server with exponential backoff.
    */
   async connectSignaling() {
+    this._reconnectAttempts = 0;
+    return this._doConnectSignaling();
+  }
+
+  _doConnectSignaling() {
     return new Promise((resolve, reject) => {
+      let isResolved = false;
       this.ws = new WebSocket(this.signalingUrl);
 
       this.ws.onopen = () => {
+        this._reconnectAttempts = 0;
         console.log(`📡 Connected to OmniCast signaling server as ${this.localPeerId}`);
+
         // Announce identity and capabilities
         this.ws.send(JSON.stringify({
           type: 'announce',
@@ -147,6 +171,7 @@ export class BroadcastManager {
         }
 
         this.startMetricsLoop();
+        isResolved = true;
         resolve(this.localPeerId);
       };
 
@@ -160,13 +185,24 @@ export class BroadcastManager {
       };
 
       this.ws.onerror = (err) => {
-        console.error('[BroadcastManager] Signaling error:', err);
-        if (this.onError) this.onError(err);
-        reject(err);
+        if (!isResolved) {
+          isResolved = true;
+          reject(err);
+        }
       };
 
       this.ws.onclose = () => {
         console.log('[BroadcastManager] Signaling closed');
+        if (!this.destroyed && this._reconnectAttempts < 6) {
+          const delay = Math.min(8000, 500 * Math.pow(2, this._reconnectAttempts));
+          this._reconnectAttempts++;
+          console.log(`[BroadcastManager] Reconnecting signaling in ${delay}ms (attempt ${this._reconnectAttempts}/6)...`);
+          this._reconnectTimer = setTimeout(() => {
+            if (!this.destroyed) {
+              this._doConnectSignaling().catch(() => {});
+            }
+          }, delay);
+        }
       };
     });
   }
@@ -196,27 +232,36 @@ export class BroadcastManager {
   // BROADCASTER WORKFLOW (Origin)
   // ──────────────────────────────────────────────────────────
 
-  async startBroadcast({ title = 'Live OmniCast Stream', type = 'camera', maxChildren = 5 } = {}) {
+  async startBroadcast({ title = 'OmniCast Live Stream', type = 'camera', maxChildren = null, deviceId = null } = {}) {
     this.role = 'broadcaster';
     this.tier = 0;
-    // Collision-resistant 16-character broadcast ID: fits exactly in 16-byte wire framing
+    this.metrics.tier = 0;
+    this.metrics.parentPeerId = null;
+
+    // Generate origin ECDSA P-256 keypair for segment signing
+    this.keyPair = await generateBroadcasterKeyPair();
+    const pubKeyInfo = await exportPublicKeyInfo(this.keyPair.publicKey);
+    this.originFingerprint = pubKeyInfo.fingerprint;
+    this.metrics.fingerprint = this.originFingerprint;
+    if (this.onMetrics) {
+      this.onMetrics({ ...this.metrics });
+    }
+
+    // Collision-resistant broadcast ID
     const timePart = Date.now().toString(36).slice(-6);
     const randPart = typeof crypto !== 'undefined' && crypto.randomUUID
       ? crypto.randomUUID().replace(/-/g, '').slice(0, 4)
       : Math.random().toString(36).substring(2, 6);
     this.broadcastId = `omni-${timePart}-${randPart}`;
-    this.streamTitle = title;
 
-    // 1. Generate origin ECDSA P-256 signing key pair
-    this.keyPair = await generateBroadcasterKeyPair();
-    const pubInfo = await exportPublicKeyInfo(this.keyPair.publicKey);
-    this.originFingerprint = pubInfo.fingerprint;
-    this.metrics.fingerprint = this.originFingerprint;
-
-    // 2. Start media capture and single encoding
+    // Initialize media capture
     this.streamCapture = new StreamCapture({
+      targetChunkMs: 500,
       onChunk: (chunk) => this.handleOriginChunk(chunk),
-      onError: (err) => this.onError && this.onError(err),
+      onError: (err) => {
+        console.error('[BroadcastManager] Capture error:', err);
+        if (this.onError) this.onError(err);
+      },
       onStop: () => this.stopBroadcast(),
       onSourceReverted: (newType, newStream) => {
         if (this.onStreamChanged) {
@@ -229,20 +274,22 @@ export class BroadcastManager {
     if (type === 'screen') {
       captureResult = await this.streamCapture.startScreen({ withMic: true });
     } else {
-      captureResult = await this.streamCapture.startCamera({ video: true, audio: true });
+      captureResult = await this.streamCapture.startCamera({ video: true, audio: true, deviceId });
     }
 
-    // 3. Register broadcast session on signaling server
+    this.streamMimeType = captureResult.mimeType;
+
+    // Register broadcast session with topology coordinator
     this.sendWs({
       type: 'broadcast:create',
       broadcastId: this.broadcastId,
-      title: this.streamTitle,
-      originPubKey: pubInfo.spkiBase64,
-      mimeType: captureResult.mimeType,
+      title,
+      originPubKey: pubKeyInfo.spkiBase64,
+      mimeType: this.streamMimeType,
       maxChildren,
     });
 
-    this.updateState('broadcasting');
+    this.updateState('streaming');
     return {
       broadcastId: this.broadcastId,
       stream: captureResult.stream,
@@ -250,14 +297,11 @@ export class BroadcastManager {
     };
   }
 
-  /**
-   * Switch live video/audio source dynamically (Camera ↔ Screen Share) without ending the broadcast.
-   */
-  async switchSource({ type = 'camera' } = {}) {
+  async switchSource({ type = 'camera', deviceId = null, forceReselect = false } = {}) {
     if (!this.streamCapture) {
       throw new Error('No active stream capture to switch');
     }
-    const result = await this.streamCapture.switchSource({ type });
+    const result = await this.streamCapture.switchSource({ type, deviceId, forceReselect });
     if (!result) return null;
 
     if (this.onStreamChanged) {
@@ -266,9 +310,20 @@ export class BroadcastManager {
     return result;
   }
 
-  /**
-   * Origin Chunk Handler: Sign once, fragment, and distribute over RTCDataChannels.
-   */
+  hasSystemAudio() {
+    return Boolean(this.streamCapture?.hasSystemAudio);
+  }
+
+  getAudioLevel() {
+    return this.streamCapture ? this.streamCapture.getAudioLevel() : 0;
+  }
+
+  setMicMuted(muted) {
+    if (this.streamCapture) {
+      this.streamCapture.setMicMuted(muted);
+    }
+  }
+
   handleOriginChunk(chunk) {
     if (this.role !== 'broadcaster' || !chunk) return;
     this.originChunkQueue.push(chunk);
@@ -292,6 +347,9 @@ export class BroadcastManager {
     if (this.role !== 'broadcaster') return;
 
     this.metrics.chunksEmitted++;
+    if (this.onMetrics) {
+      this.onMetrics({ ...this.metrics });
+    }
 
     // Sign the logical chunk using Origin ECDSA P-256 private key
     const isInitChunk = Boolean(chunk.isInit);
@@ -334,6 +392,9 @@ export class BroadcastManager {
     // 2. Distribute binary packets directly to all downstream child DataChannels that are synced
     for (const [, childLink] of this.children) {
       if (childLink.isOpen() && childLink._hasSynced) {
+        if (typeof childLink._lastSyncedSeq === 'number' && chunk.sequence <= childLink._lastSyncedSeq) {
+          continue; // Already dispatched during syncChildWithStream
+        }
         try {
           for (const packet of packets) {
             childLink.sendBinary(packet);
@@ -360,6 +421,9 @@ export class BroadcastManager {
       onGapSkipped: (fromSeq, toSeq) => {
         if (this.msePlayer) {
           this.msePlayer.onGapOccurred();
+        }
+        if (this.parentLink && this.parentLink.isOpen()) {
+          this.parentLink.sendControl({ type: 'bootstrap-req' });
         }
       },
     });
@@ -443,11 +507,21 @@ export class BroadcastManager {
       },
     });
 
+    // 15-second ICE connect timeout
+    this.parentLink.startIceConnectTimeout(() => {
+      console.warn(`[BroadcastManager] Parent connection ICE timeout (15s), reporting link failed`);
+      this.sendWs({
+        type: 'topology:link-failed',
+        broadcastId: this.broadcastId,
+        failedParentPeerId: parentPeerId,
+      });
+      this.triggerFailover();
+    });
+
     this.parentLink.createAndSendOffer();
   }
 
   prepareStandbys() {
-    // Keep 1 or 2 standby candidate links ready
     for (const standbyId of this.standbyCandidateIds.slice(0, 2)) {
       if (!this.standbyLinks.has(standbyId) && standbyId !== this.metrics.parentPeerId) {
         const link = new PeerLink({
@@ -469,18 +543,24 @@ export class BroadcastManager {
 
     this.upstreamWatchdogTimer = setInterval(() => {
       if (this.role !== 'viewer' || !this.broadcastId) return;
-      if (!this.parentLink || !this.parentLink.isOpen()) return;
-      if (Date.now() - this.lastPacketAt < 6000) return;
+      if (!this.parentLink) return;
+      const silentMs = Date.now() - this.lastPacketAt;
+      if (silentMs < 7000) return;
 
       this.bootstrapRetryCount++;
-      this.parentLink.sendControl({ type: 'bootstrap-req' });
-      this.updateState('reconnecting');
+      if (this.parentLink.isOpen()) {
+        this.parentLink.sendControl({ type: 'bootstrap-req' });
+      }
 
-      if (this.bootstrapRetryCount >= 3) {
-        const parentPeerId = this.parentLink.remotePeerId;
+      if (silentMs > 12000) {
+        this.updateState('reconnecting');
+      }
+
+      if (this.bootstrapRetryCount >= 4 || silentMs > 18000) {
+        console.warn(`[BroadcastManager] Upstream watchdog: ${silentMs}ms silent, triggering failover...`);
         this.bootstrapRetryCount = 0;
         this.lastPacketAt = Date.now();
-        this.connectToParent(parentPeerId);
+        this.triggerFailover();
       }
     }, 3000);
   }
@@ -491,6 +571,7 @@ export class BroadcastManager {
   handleIncomingBinary(arrayBuffer) {
     if (!(arrayBuffer instanceof ArrayBuffer)) return;
     this.lastPacketAt = Date.now();
+    this.bootstrapRetryCount = 0;
     this.incomingPacketQueue.push(arrayBuffer);
     void this.processIncomingPacketQueue();
   }
@@ -504,10 +585,17 @@ export class BroadcastManager {
       onLiveStateChange: (state) => {
         if (this.onLiveStateChange) this.onLiveStateChange(state);
       },
+      onNeedBootstrap: () => {
+        console.warn('[BroadcastManager] MsePlayer requested bootstrap resync');
+        if (this.parentLink && this.parentLink.isOpen()) {
+          this.parentLink.sendControl({ type: 'bootstrap-req' });
+        }
+      },
     });
   }
 
   resetPlaybackForResync() {
+    this.lastInitSequence = null;
     if (this.msePlayer) {
       this.msePlayer.destroy();
       this.msePlayer = null;
@@ -543,6 +631,7 @@ export class BroadcastManager {
       }
 
       this.metrics.chunksReceived++;
+      this.bootstrapRetryCount = 0;
 
       // Verify origin ECDSA P-256 signature before playback or forwarding
       if (this.originPublicKey) {
@@ -557,7 +646,6 @@ export class BroadcastManager {
       // Calculate glass-to-glass latency estimate
       if (completeChunk.timestamp) {
         const diff = Date.now() - completeChunk.timestamp;
-        // Avoid cross-device clock skew displaying phantom 54,000ms latency:
         if (diff >= 0 && diff < 8000) {
           this.metrics.liveLatencyMs = diff;
         } else if (this.msePlayer) {
@@ -574,20 +662,29 @@ export class BroadcastManager {
       // ── CASCADE FORWARDING: Forward all verified wire packets to downstream children ──
       if (completeChunk.rawPackets && completeChunk.rawPackets.length > 0) {
         for (const raw of completeChunk.rawPackets) {
-          this.forwardToChildren(raw);
+          this.forwardToChildren(raw, completeChunk.sequence);
         }
       } else {
-        this.forwardToChildren(arrayBuffer);
+        this.forwardToChildren(arrayBuffer, completeChunk.sequence);
+      }
+
+      // If this was an init segment or keyframe, sync any children that were waiting
+      if (completeChunk.type === PacketType.INIT_SEGMENT || completeChunk.isKeyframe) {
+        for (const [, childLink] of this.children) {
+          if (childLink.isOpen() && !childLink._hasSynced) {
+            this.syncChildWithStream(childLink);
+          }
+        }
       }
 
       // Push to reorder queue for local playback
       if (completeChunk.type === PacketType.INIT_SEGMENT) {
-        // Init segment bypasses sequence queue and feeds directly to MSE
-        // It still consumes a logical sequence number. Reset the media queue
-        // to the first chunk of this new container epoch so a source switch
-        // is not misreported as a lost media packet.
+        if (this.lastInitSequence === completeChunk.sequence) {
+          return; // Skip duplicate init segment to protect SourceBuffer against demuxer abort
+        }
+        this.lastInitSequence = completeChunk.sequence;
         if (this.reorderQueue) {
-          this.reorderQueue.reset(completeChunk.sequence + 1);
+          this.reorderQueue.reset();
         }
         this.renderChunk(completeChunk);
       } else if (this.reorderQueue) {
@@ -610,26 +707,35 @@ export class BroadcastManager {
 
   /**
    * Forwards incoming verified binary chunk to all active downstream children.
-   * Ensures children are bootstrapped with init segment and keyframe before receiving live chunks.
    */
-  forwardToChildren(arrayBuffer) {
+  forwardToChildren(arrayBuffer, chunkSeq = null) {
     if (this.children.size === 0) return;
 
+    // Throttled debug log per relay hop
+    if (!this._lastRelayLog || Date.now() - this._lastRelayLog > 1000) {
+      this._lastRelayLog = Date.now();
+      for (const [childId, childLink] of this.children) {
+        console.debug(`[Relay] relay forward seq=${chunkSeq} to child ${childId.slice(-8)} (synced=${childLink._hasSynced})`);
+      }
+    }
+
     for (const [, childLink] of this.children) {
-      if (childLink.isOpen()) {
-        if (!childLink._hasSynced) {
-          this.syncChildWithStream(childLink);
+      if (!childLink._hasSynced && childLink.isOpen()) {
+        this.syncChildWithStream(childLink);
+      }
+
+      if (childLink.isOpen() && childLink._hasSynced) {
+        if (typeof chunkSeq === 'number' && typeof childLink._lastSyncedSeq === 'number' && chunkSeq <= childLink._lastSyncedSeq) {
+          continue; // Already dispatched during syncChildWithStream
         }
-        if (childLink._hasSynced) {
-          try {
-            const sent = childLink.sendBinary(arrayBuffer);
-            if (sent) {
-              this.metrics.chunksForwarded++;
-              this.metrics.bytesSent += arrayBuffer.byteLength;
-            }
-          } catch (err) {
-            console.warn(`[BroadcastManager] Failed to forward packet to child ${childLink.remotePeerId.slice(-8)}:`, err.message);
+        try {
+          const sent = childLink.sendBinary(arrayBuffer);
+          if (sent) {
+            this.metrics.chunksForwarded++;
+            this.metrics.bytesSent += arrayBuffer.byteLength;
           }
+        } catch (err) {
+          console.warn(`[BroadcastManager] Failed to forward packet to child ${childLink.remotePeerId.slice(-8)}:`, err.message);
         }
       }
     }
@@ -651,8 +757,7 @@ export class BroadcastManager {
 
   handleParentControlMessage(msg) {
     if (msg.type === 'heartbeat') {
-      // Respond to heartbeat
-      if (this.parentLink) {
+      if (this.parentLink && this.parentLink.isOpen()) {
         this.parentLink.sendControl({ type: 'heartbeat-ack', timestamp: msg.timestamp });
       }
     }
@@ -687,7 +792,7 @@ export class BroadcastManager {
       this.children.set(childPeerId, childLink);
       this.metrics.activeChildren = this.children.size;
 
-      // Fallback check in case child opened before listener
+      // Fallback check in case child opened before listener attached
       const checkAndSendInit = setInterval(() => {
         if (childLink.isOpen()) {
           clearInterval(checkAndSendInit);
@@ -695,7 +800,12 @@ export class BroadcastManager {
         }
       }, 50);
 
-      setTimeout(() => clearInterval(checkAndSendInit), 5000);
+      setTimeout(() => {
+        clearInterval(checkAndSendInit);
+        if (childLink.isOpen() && !childLink._hasSynced) {
+          this.syncChildWithStream(childLink);
+        }
+      }, 500);
     }
   }
 
@@ -705,17 +815,18 @@ export class BroadcastManager {
    * Only marks child as synced if both init segment and keyframe are sent.
    */
   syncChildWithStream(childLink) {
-    if (!childLink || !childLink.isOpen() || childLink._hasSynced) return;
+    if (!childLink || !childLink.isOpen() || childLink._hasSynced) return false;
 
     const initSeg = this.ringBuffer.getInitSegment();
     const recentChunks = this.ringBuffer.getSinceLatestKeyframe();
 
     // If init segment or keyframe is not ready yet, wait until one is available
     if (!initSeg || recentChunks.length === 0 || !recentChunks.some((chunk) => chunk.isKeyframe)) {
-      return; // Do NOT set _hasSynced = true yet! Will sync when first keyframe is added.
+      return false; // Not ready to sync yet
     }
 
     childLink._hasSynced = true;
+    childLink._lastSyncedSeq = recentChunks[recentChunks.length - 1].sequence;
 
     // 1. Send initialization segment (EBML header)
     const packets = fragmentChunk({
@@ -733,7 +844,7 @@ export class BroadcastManager {
 
     // 2. Send latest keyframe and subsequent chunks from ring buffer for immediate playback
     for (const chunk of recentChunks) {
-      if (chunk.isInit || chunk.type === PacketType.INIT_SEGMENT) continue; // init segment already sent
+      if (chunk.isInit || chunk.type === PacketType.INIT_SEGMENT) continue;
       const isInit = Boolean(chunk.isInit || chunk.type === PacketType.INIT_SEGMENT);
       const pkts = fragmentChunk({
         type: isInit ? PacketType.INIT_SEGMENT : PacketType.MEDIA_CHUNK,
@@ -748,6 +859,7 @@ export class BroadcastManager {
         childLink.sendBinary(p);
       }
     }
+    return true;
   }
 
   handleChildControlMessage(childPeerId, msg) {
@@ -755,7 +867,11 @@ export class BroadcastManager {
       const childLink = this.children.get(childPeerId);
       if (childLink) {
         childLink._hasSynced = false;
-        this.syncChildWithStream(childLink);
+        const synced = this.syncChildWithStream(childLink);
+        if (!synced && this.parentLink && this.parentLink.isOpen()) {
+          // Cannot satisfy locally yet, pass upstream to origin
+          this.parentLink.sendControl({ type: 'bootstrap-req' });
+        }
       }
       return;
     }
@@ -794,7 +910,7 @@ export class BroadcastManager {
     this.resetPlaybackForResync();
 
     if (this.standbyCandidateIds.length > 0) {
-      const promotedStandby = this.standbyCandidateIds[0];
+      const promotedStandby = this.standbyCandidateIds.shift();
       console.log(`⚡ Instant Failover: Promoting standby parent ${promotedStandby.slice(-8)}`);
 
       // Inform coordinator of standby promotion
@@ -804,7 +920,14 @@ export class BroadcastManager {
         standbyPeerId: promotedStandby,
       });
 
-      // Switch to standby link
+      // Clean up standby link
+      const existingStandby = this.standbyLinks.get(promotedStandby);
+      if (existingStandby) {
+        this.standbyLinks.delete(promotedStandby);
+        existingStandby.cleanup();
+      }
+
+      // Switch to standby link as active parent
       this.connectToParent(promotedStandby);
 
       const failoverDurationMs = Math.round(performance.now() - startTime);
@@ -891,6 +1014,9 @@ export class BroadcastManager {
 
       case 'broadcast:viewer-count':
         this.metrics.viewerCount = msg.viewerCount;
+        if (this.onMetrics) {
+          this.onMetrics({ ...this.metrics });
+        }
         break;
 
       case 'broadcast:announced':
@@ -915,7 +1041,9 @@ export class BroadcastManager {
 
       case 'error':
         console.warn('[BroadcastManager] Signaling error received:', msg.code, msg.message);
-        if (msg.code === 'JOIN_FAILED') {
+        if (msg.code === 'ROOM_FULL') {
+          this.updateState('full', { errorCode: msg.code, errorMessage: msg.message });
+        } else if (msg.code === 'JOIN_FAILED') {
           this.updateState('not_found', { errorMessage: msg.message });
         } else {
           this.updateState('error', { errorCode: msg.code, errorMessage: msg.message });
@@ -944,10 +1072,13 @@ export class BroadcastManager {
       this.metrics.tier = this.tier;
       this.metrics.activeChildren = this.children.size;
 
-      // Measure RTT with parent
+      // Measure RTT and candidate stats with parent
       if (this.parentLink) {
         const stats = await this.parentLink.measureStats();
         this.metrics.parentRtt = stats.rttMs;
+        this.metrics.selectedCandidateType = stats.selectedCandidateType || this.parentLink.selectedCandidateType || 'unknown';
+      } else {
+        this.metrics.selectedCandidateType = 'none';
       }
 
       // Collect real-time video playback quality & decoder telemetry
@@ -959,7 +1090,24 @@ export class BroadcastManager {
           this.metrics.droppedFrames = pStats.quality.droppedFrames || 0;
           this.metrics.totalFrames = pStats.quality.totalFrames || 0;
         }
+        this.metrics.waitingForKeyframe = Boolean(this.msePlayer.waitingForKeyframe);
+      } else {
+        this.metrics.waitingForKeyframe = false;
       }
+
+      if (this.reorderQueue) {
+        this.metrics.gapsSkipped = this.reorderQueue.gapsSkipped || 0;
+      }
+
+      this.metrics.childLinks = Array.from(this.children.entries()).map(([pid, link]) => ({
+        peerId: pid,
+        open: link.isOpen(),
+        hasSynced: Boolean(link._hasSynced),
+        queuedPackets: link.pendingQueue ? link.pendingQueue.length : 0,
+        candidateType: link.selectedCandidateType || link.stats?.selectedCandidateType || 'unknown',
+      }));
+
+      this.metrics.lastPacketAtAgeMs = this.lastPacketAt ? Math.max(0, Date.now() - this.lastPacketAt) : null;
 
       if (this.streamCapture) {
         this.metrics.captureFps = this.streamCapture.getCaptureFps();
@@ -981,9 +1129,9 @@ export class BroadcastManager {
     }, 1000);
   }
 
-  updateState(state) {
+  updateState(state, extra = {}) {
     if (this.onStateChange) {
-      this.onStateChange(state, { ...this.metrics });
+      this.onStateChange(state, { ...this.metrics, ...extra });
     }
   }
 
@@ -1037,12 +1185,22 @@ export class BroadcastManager {
     }
     this.reassembler.clear();
 
+    this.standbyCandidateIds = [];
+    this.bootstrapRetryCount = 0;
+    this.videoElement = null;
+    this.lastInitSequence = null;
+
     this.role = 'idle';
     this.broadcastId = null;
     this.updateState('idle');
   }
 
   destroy() {
+    this.destroyed = true;
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     this.stopBroadcast();
     if (this.metricsTimer) {
       clearInterval(this.metricsTimer);
@@ -1054,4 +1212,3 @@ export class BroadcastManager {
     }
   }
 }
-

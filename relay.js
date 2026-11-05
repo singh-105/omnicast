@@ -14,6 +14,7 @@ import { TopologyCoordinator } from './src/features/broadcast/topology/topologyC
 
 const KEY_FILE = './relay-key.json';
 const SIGNALING_PATH = '/signaling';
+const BROADCAST_ID_REGEX = /^[A-Za-z0-9_-]{1,16}$/;
 
 // The single port Render or local dev exposes.
 const PUBLIC_PORT = Number(process.env.PORT || 10000);
@@ -41,7 +42,10 @@ async function getOrCreatePrivateKey() {
 // Central WebSocket transmits ONLY signaling (SDP/ICE), session management,
 // and tree topology coordination. ZERO MEDIA PAYLOAD BYTES ARE PERMITTED.
 function createSignalingServer(topologyCoordinator) {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: 256 * 1024, // 256 KB max message payload
+  });
 
   // Map: peerId -> { ws, capabilities, activeBroadcastId, role }
   const connectedPeers = new Map();
@@ -114,10 +118,22 @@ function createSignalingServer(topologyCoordinator) {
           // ── Broadcaster creates a new live broadcast ──
           case 'broadcast:create': {
             const { broadcastId, title, originPubKey, mimeType, maxChildren } = msg;
+
+            if (!broadcastId || !BROADCAST_ID_REGEX.test(broadcastId)) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                code: 'INVALID_BROADCAST_ID',
+                message: 'Invalid broadcast ID format (1-16 alphanumeric or hyphen/underscore characters)',
+              }));
+              break;
+            }
+
+            const sanitizedTitle = (title || 'OmniCast Live Stream').slice(0, 100);
+
             try {
               const session = topologyCoordinator.createBroadcast({
                 broadcastId,
-                title,
+                title: sanitizedTitle,
                 originPeerId: thisPeerId,
                 originPubKey,
                 mimeType,
@@ -153,7 +169,7 @@ function createSignalingServer(topologyCoordinator) {
                 },
               }, thisPeerId);
 
-              console.log(`📡 Broadcast created: "${title}" [${broadcastId}] by ${thisPeerId.slice(-8)}`);
+              console.log(`📡 Broadcast created: "${sanitizedTitle}" [${broadcastId}] by ${thisPeerId.slice(-8)}`);
             } catch (err) {
               ws.send(JSON.stringify({
                 type: 'error',
@@ -190,6 +206,16 @@ function createSignalingServer(topologyCoordinator) {
           // ── Viewer joins a broadcast ──
           case 'broadcast:join': {
             const { broadcastId, capabilities } = msg;
+
+            if (!broadcastId || !BROADCAST_ID_REGEX.test(broadcastId)) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                code: 'INVALID_BROADCAST_ID',
+                message: 'Invalid broadcast ID format',
+              }));
+              break;
+            }
+
             try {
               const assignment = topologyCoordinator.joinViewer({
                 broadcastId,
@@ -223,7 +249,7 @@ function createSignalingServer(topologyCoordinator) {
                 broadcastToAll({
                   type: 'broadcast:viewer-count',
                   broadcastId,
-                  viewerCount: bcast.nodes.size - 1,
+                  viewerCount: Math.max(0, bcast.nodes.size - 1),
                   maxTier: Math.max(0, ...bcast.tiers.values()),
                 });
               }
@@ -232,7 +258,7 @@ function createSignalingServer(topologyCoordinator) {
             } catch (err) {
               ws.send(JSON.stringify({
                 type: 'error',
-                code: 'JOIN_FAILED',
+                code: err.code || 'JOIN_FAILED',
                 message: err.message,
               }));
             }
@@ -247,9 +273,34 @@ function createSignalingServer(topologyCoordinator) {
           }
 
           // ── WebRTC Signaling Relay (SDP Offer, Answer, ICE Candidate) ──
-          // Strictly point-to-point forwarding; no video payloads!
+          // Strictly point-to-point forwarding; no video payloads on signaling path!
           case 'signal:relay': {
             const { toPeerId, broadcastId, signalType, signalData } = msg;
+            const targetPeer = connectedPeers.get(toPeerId);
+
+            if (!targetPeer) {
+              ws.send(JSON.stringify({
+                type: 'signal:failed',
+                targetPeerId: toPeerId,
+                reason: 'Peer unreachable or disconnected',
+              }));
+              break;
+            }
+
+            // Enforce same session if session is active
+            if (broadcastId && targetPeer.activeBroadcastId && targetPeer.activeBroadcastId !== broadcastId) {
+              ws.send(JSON.stringify({
+                type: 'signal:failed',
+                targetPeerId: toPeerId,
+                reason: 'Cross-session signaling rejected',
+              }));
+              break;
+            }
+
+            if (signalType === 'offer' || signalType === 'answer') {
+              console.log(`[Signal] ${thisPeerId.slice(-8)} -> ${toPeerId.slice(-8)}: ${signalType}`);
+            }
+
             const delivered = sendToPeer(toPeerId, {
               type: 'signal:relay',
               fromPeerId: thisPeerId,
@@ -291,6 +342,33 @@ function createSignalingServer(topologyCoordinator) {
               });
 
               console.log(`⚡ Failover: Peer ${thisPeerId.slice(-8)} promoted standby parent ${newAssignment.parentPeerId.slice(-8)} (Tier ${newAssignment.tier})`);
+            }
+            break;
+          }
+
+          // ── Link Failed Notification (ICE or transport timeout) ──
+          case 'topology:link-failed': {
+            const { broadcastId, failedParentPeerId } = msg;
+            const newAssignment = topologyCoordinator.reportLinkFailed({
+              broadcastId,
+              peerId: thisPeerId,
+              failedParentPeerId,
+            });
+
+            if (newAssignment) {
+              ws.send(JSON.stringify({
+                type: 'topology:assigned',
+                ...newAssignment,
+              }));
+
+              sendToPeer(newAssignment.parentPeerId, {
+                type: 'topology:child-assigned',
+                broadcastId,
+                childPeerId: thisPeerId,
+                tier: newAssignment.tier,
+              });
+
+              console.log(`⚠️ Link failure recovered: Peer ${thisPeerId.slice(-8)} reassigned to ${newAssignment.parentPeerId.slice(-8)} (Tier ${newAssignment.tier})`);
             }
             break;
           }
@@ -359,7 +437,7 @@ function createSignalingServer(topologyCoordinator) {
         broadcastToAll({
           type: 'broadcast:viewer-count',
           broadcastId,
-          viewerCount: bcast.nodes.size - 1,
+          viewerCount: Math.max(0, bcast.nodes.size - 1),
           maxTier: Math.max(0, ...bcast.tiers.values()),
         });
       }

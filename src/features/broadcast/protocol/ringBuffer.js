@@ -13,19 +13,17 @@ export class MediaRingBuffer {
    * @param {number} [options.maxItems=60] - Maximum logical chunks retained (~18s at 300ms)
    * @param {number} [options.maxDurationMs=15000] - Evict items older than 15 seconds
    */
-  constructor({ maxItems = 60, maxDurationMs = 15000 } = {}) {
+  constructor({ maxItems = 240, maxDurationMs = 30000 } = {}) {
     this.maxItems = maxItems;
     this.maxDurationMs = maxDurationMs;
     // Map of sequence -> chunkObject
     this.buffer = new Map();
-    // Cache for initialization segment (must persist across the entire broadcast)
+    // Cache for initialization segment (must persist across current epoch)
     this.initSegment = null;
+    this.currentEpochInitSeq = -1;
     this.highestSequence = -1;
     // Track sequence number of the most recent verified keyframe
     this.latestKeyframeSeq = -1;
-    // Keep the first decodable media chunk as a recovery anchor. Some
-    // MediaRecorder implementations expose only one detectable keyframe for
-    // an entire recording epoch.
     this.bootstrapKeyframe = null;
   }
 
@@ -34,6 +32,18 @@ export class MediaRingBuffer {
    */
   setInitSegment(chunk) {
     this.initSegment = chunk;
+    if (chunk && typeof chunk.sequence === 'number') {
+      this.currentEpochInitSeq = chunk.sequence;
+      // Reset epoch-specific bootstrap anchors on fresh init segment
+      this.bootstrapKeyframe = null;
+      this.latestKeyframeSeq = -1;
+      // Ring buffer retains only from the latest init epoch
+      for (const [seq] of this.buffer) {
+        if (seq < chunk.sequence) {
+          this.buffer.delete(seq);
+        }
+      }
+    }
   }
 
   getInitSegment() {
@@ -105,11 +115,36 @@ export class MediaRingBuffer {
   /**
    * Returns all chunks starting from the most recent keyframe up to the newest sequence.
    * Enables immediate, stall-free playback synchronization for late-joining children.
+   * Ensures the returned slice starts with a valid Matroska Cluster (0x1F 0x43 0xB6 0x75)
+   * so MSE decoders do not throw CHUNK_DEMUXER_ERROR_APPEND_FAILED (Unexpected element ID).
    */
   getSinceLatestKeyframe() {
     const all = this.getAll();
-    if (all.length === 0) return [];
+    if (all.length === 0) {
+      return this.bootstrapKeyframe ? [this.bootstrapKeyframe] : [];
+    }
 
+    // 1. Prefer the current epoch's bootstrap keyframe (which begins at the Matroska Cluster header)
+    if (this.bootstrapKeyframe) {
+      const bSeq = this.bootstrapKeyframe.sequence;
+      const bIdx = all.findIndex((c) => c.sequence === bSeq);
+      if (bIdx !== -1) {
+        return all.slice(bIdx);
+      }
+      if (all[0].sequence === bSeq + 1) {
+        return [this.bootstrapKeyframe, ...all];
+      }
+    }
+
+    // 2. Otherwise search for the latest chunk that starts with Matroska Cluster [0x1f, 0x43, 0xb6, 0x75]
+    for (let i = all.length - 1; i >= 0; i--) {
+      const p = all[i].payload;
+      if (p && p.length >= 4 && p[0] === 0x1f && p[1] === 0x43 && p[2] === 0xb6 && p[3] === 0x75) {
+        return all.slice(i);
+      }
+    }
+
+    // 3. Fallback: find any marked keyframe, or return bootstrap / all
     let keyframeIndex = -1;
     for (let i = all.length - 1; i >= 0; i--) {
       if (all[i].isKeyframe) {
@@ -118,18 +153,11 @@ export class MediaRingBuffer {
       }
     }
 
-    if (keyframeIndex === -1) {
-      if (!this.bootstrapKeyframe) return [];
-
-      // The anchor may have been evicted from the bounded map. Re-send it
-      // followed by the retained tail so a child can recover without waiting
-      // for a future keyframe.
-      return [
-        this.bootstrapKeyframe,
-        ...all.filter((chunk) => chunk.sequence > this.bootstrapKeyframe.sequence),
-      ];
+    if (keyframeIndex !== -1) {
+      return all.slice(keyframeIndex);
     }
-    return all.slice(keyframeIndex);
+
+    return this.bootstrapKeyframe ? [this.bootstrapKeyframe] : all;
   }
 
   /**
@@ -218,6 +246,7 @@ export class SequenceReorderQueue {
     this.gapTimer = null;
     this.processedSequences = new Set(); // Small LRU / set to dedupe
     this.maxDedupeSize = 100;
+    this.gapsSkipped = 0;
   }
 
   /**
@@ -287,6 +316,7 @@ export class SequenceReorderQueue {
     const gapFrom = this.expectedSequence;
     const gapTo = lowestAvailable - 1;
     this.expectedSequence = lowestAvailable;
+    this.gapsSkipped++;
 
     if (this.onGapSkipped) {
       this.onGapSkipped(gapFrom, gapTo);
