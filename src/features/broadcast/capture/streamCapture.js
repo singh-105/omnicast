@@ -152,13 +152,36 @@ export class StreamCapture {
       throw new Error('Screen sharing is not supported in this browser');
     }
 
-    const screenStream = await navigator.mediaDevices.getDisplayMedia({
+    const displayOptions = {
       video: {
         cursor: 'always',
         frameRate: { ideal: 30, max: 30 },
       },
-      audio: true, // system/tab audio
-    });
+      audio: {
+        suppressLocalAudioPlayback: false,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+      systemAudio: 'include',
+      selfBrowserSurface: 'include',
+      surfaceSwitching: 'include',
+    };
+
+    let screenStream;
+    try {
+      screenStream = await navigator.mediaDevices.getDisplayMedia(displayOptions);
+    } catch (_) {
+      // Fallback for browsers that don't support extended systemAudio constraints
+      screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: 'always', frameRate: { ideal: 30, max: 30 } },
+        audio: true,
+      });
+    }
+
+    const screenAudioTracks = screenStream.getAudioTracks();
+    const hasScreenAudio = screenAudioTracks.length > 0;
+    console.log(`[Capture] Screen capture audio tracks: ${screenAudioTracks.length} (System sound: ${hasScreenAudio ? 'ACTIVE' : 'NONE'})`);
 
     let finalStream = screenStream;
 
@@ -171,19 +194,33 @@ export class StreamCapture {
 
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
         if (AudioCtx) {
+          if (this.audioContext) {
+            try { this.audioContext.close(); } catch (_) {}
+          }
           this.audioContext = new AudioCtx();
           if (this.audioContext.state === 'suspended') {
             await this.audioContext.resume();
           }
           const dest = this.audioContext.createMediaStreamDestination();
 
-          if (screenStream.getAudioTracks().length > 0) {
-            const screenSource = this.audioContext.createMediaStreamSource(screenStream);
-            screenSource.connect(dest);
+          // Mix system/screen audio if present
+          if (hasScreenAudio) {
+            const screenAudioStream = new MediaStream(screenAudioTracks);
+            const screenSource = this.audioContext.createMediaStreamSource(screenAudioStream);
+            const screenGain = this.audioContext.createGain();
+            screenGain.gain.value = 1.0;
+            screenSource.connect(screenGain);
+            screenGain.connect(dest);
           }
 
-          const micSource = this.audioContext.createMediaStreamSource(micStream);
-          micSource.connect(dest);
+          // Mix mic audio
+          if (micStream.getAudioTracks().length > 0) {
+            const micSource = this.audioContext.createMediaStreamSource(micStream);
+            const micGain = this.audioContext.createGain();
+            micGain.gain.value = 0.9;
+            micSource.connect(micGain);
+            micGain.connect(dest);
+          }
 
           finalStream = new MediaStream([
             ...screenStream.getVideoTracks(),
@@ -380,10 +417,26 @@ export class StreamCapture {
         throw new Error('Screen sharing is not supported in this browser');
       }
       try {
-        newStream = await navigator.mediaDevices.getDisplayMedia({
+        const displayOptions = {
           video: { cursor: 'always', frameRate: { ideal: 30, max: 30 } },
-          audio: true,
-        });
+          audio: {
+            suppressLocalAudioPlayback: false,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+          systemAudio: 'include',
+          selfBrowserSurface: 'include',
+          surfaceSwitching: 'include',
+        };
+        try {
+          newStream = await navigator.mediaDevices.getDisplayMedia(displayOptions);
+        } catch (_) {
+          newStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { cursor: 'always', frameRate: { ideal: 30, max: 30 } },
+            audio: true,
+          });
+        }
       } catch (err) {
         if (err.name === 'NotAllowedError') {
           console.log('[Capture] User cancelled screen picker dialog; active stream remains unchanged.');
@@ -391,6 +444,10 @@ export class StreamCapture {
         }
         throw err;
       }
+
+      const screenAudioTracks = newStream.getAudioTracks();
+      const hasScreenAudio = screenAudioTracks.length > 0;
+      console.log(`[Capture] Switch to screen audio tracks: ${screenAudioTracks.length} (System sound: ${hasScreenAudio ? 'ACTIVE' : 'NONE'})`);
 
       // Mix mic if requested
       if (withMic && navigator.mediaDevices.getUserMedia) {
@@ -408,12 +465,26 @@ export class StreamCapture {
               await this.audioContext.resume();
             }
             const dest = this.audioContext.createMediaStreamDestination();
-            if (newStream.getAudioTracks().length > 0) {
-              const screenSource = this.audioContext.createMediaStreamSource(newStream);
-              screenSource.connect(dest);
+
+            // Mix system/screen audio
+            if (hasScreenAudio) {
+              const screenAudioStream = new MediaStream(screenAudioTracks);
+              const screenSource = this.audioContext.createMediaStreamSource(screenAudioStream);
+              const screenGain = this.audioContext.createGain();
+              screenGain.gain.value = 1.0;
+              screenSource.connect(screenGain);
+              screenGain.connect(dest);
             }
-            const micSource = this.audioContext.createMediaStreamSource(micStream);
-            micSource.connect(dest);
+
+            // Mix mic audio
+            if (micStream.getAudioTracks().length > 0) {
+              const micSource = this.audioContext.createMediaStreamSource(micStream);
+              const micGain = this.audioContext.createGain();
+              micGain.gain.value = 0.9;
+              micSource.connect(micGain);
+              micGain.connect(dest);
+            }
+
             newStream = new MediaStream([
               ...newStream.getVideoTracks(),
               ...dest.stream.getAudioTracks(),
