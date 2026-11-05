@@ -297,17 +297,31 @@ export class BroadcastManager {
     };
   }
 
-  async switchSource({ type = 'camera', deviceId = null } = {}) {
+  async switchSource({ type = 'camera', deviceId = null, forceReselect = false } = {}) {
     if (!this.streamCapture) {
       throw new Error('No active stream capture to switch');
     }
-    const result = await this.streamCapture.switchSource({ type, deviceId });
+    const result = await this.streamCapture.switchSource({ type, deviceId, forceReselect });
     if (!result) return null;
 
     if (this.onStreamChanged) {
       this.onStreamChanged(result.stream, result.type);
     }
     return result;
+  }
+
+  hasSystemAudio() {
+    return Boolean(this.streamCapture?.hasSystemAudio);
+  }
+
+  getAudioLevel() {
+    return this.streamCapture ? this.streamCapture.getAudioLevel() : 0;
+  }
+
+  setMicMuted(muted) {
+    if (this.streamCapture) {
+      this.streamCapture.setMicMuted(muted);
+    }
   }
 
   handleOriginChunk(chunk) {

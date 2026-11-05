@@ -377,21 +377,21 @@ export const WatcherView = ({
           </div>
         )}
 
-        {/* Autoplay Muted Notice */}
-        {autoplayBlocked && connectionState === 'playing' && (
-          <div className="absolute top-4 inset-x-4 max-w-sm mx-auto p-3 rounded-xl bg-neon-rose text-white text-xs font-bold flex items-center justify-between shadow-xl z-30">
-            <span>Audio is muted by browser.</span>
+        {/* Floating Unmute Button (Essential for mobile & desktop autoplay policy) */}
+        {isMuted && connectionState === 'playing' && (
+          <div className="absolute top-4 inset-x-4 max-w-xs mx-auto z-30">
             <button
               onClick={toggleMute}
-              className="px-3 py-1 rounded-lg bg-white text-zinc-950 text-xs font-bold uppercase cursor-pointer"
+              className="w-full px-4 py-2.5 rounded-full bg-cerulean text-white text-xs font-mono font-bold flex items-center justify-center gap-2 shadow-2xl hover:brightness-110 active:scale-95 transition-all cursor-pointer animate-pulse"
             >
-              Unmute
+              <Volume2 className="w-4 h-4 fill-current" />
+              <span>Tap to Unmute Stream Audio</span>
             </button>
           </div>
         )}
 
         {/* Player Controls Bar */}
-        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-[#0A0A0A]/90 via-[#0A0A0A]/40 to-transparent p-4 opacity-0 group-hover:opacity-100 transition-opacity duration-200 flex items-center justify-between z-20">
+        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-[#0A0A0A]/90 via-[#0A0A0A]/40 to-transparent p-4 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-200 flex items-center justify-between z-20">
           <div className="flex items-center gap-3">
             <button
               onClick={togglePlay}

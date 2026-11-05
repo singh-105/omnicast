@@ -12,11 +12,14 @@ import {
   ChevronDown,
   ChevronUp,
   AlertTriangle,
+  AlertCircle,
   Clock,
   Layers,
   Activity,
   Zap,
   Globe,
+  Volume2,
+  RotateCcw,
 } from 'lucide-react';
 
 export const StudioView = ({
@@ -36,6 +39,19 @@ export const StudioView = ({
   const [localMetrics, setLocalMetrics] = useState(metrics || {});
   const [availableCameras, setAvailableCameras] = useState([]);
   const [selectedCameraId, setSelectedCameraId] = useState('');
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [hasScreenAudio, setHasScreenAudio] = useState(false);
+
+  // Monitor live screen audio levels and presence
+  useEffect(() => {
+    if (!isLive || !broadcastManager) return;
+    const interval = setInterval(() => {
+      const level = broadcastManager.getAudioLevel ? broadcastManager.getAudioLevel() : 0;
+      setAudioLevel(level);
+      setHasScreenAudio(broadcastManager.hasSystemAudio ? broadcastManager.hasSystemAudio() : false);
+    }, 100);
+    return () => clearInterval(interval);
+  }, [isLive, broadcastManager]);
 
   // Discover and enumerate available cameras
   useEffect(() => {
@@ -173,8 +189,8 @@ export const StudioView = ({
     setIsLive(false);
   };
 
-  const handleSwitchSource = async (newType) => {
-    if (newType === streamType) return;
+  const handleSwitchSource = async (newType, forceReselect = false) => {
+    if (newType === streamType && !forceReselect) return;
     setErrorMsg('');
 
     if (isLive) {
@@ -182,6 +198,7 @@ export const StudioView = ({
         const res = await broadcastManager.switchSource({
           type: newType,
           deviceId: newType === 'camera' ? selectedCameraId : null,
+          forceReselect,
         });
         if (res) {
           setStreamType(res.type);
@@ -197,11 +214,15 @@ export const StudioView = ({
   };
 
   const toggleAudio = () => {
-    if (activeStream) {
+    const nextMuted = !isAudioMuted;
+    setIsAudioMuted(nextMuted);
+    if (broadcastManager) {
+      broadcastManager.setMicMuted(nextMuted);
+    }
+    if (streamType === 'camera' && activeStream) {
       activeStream.getAudioTracks().forEach((track) => {
-        track.enabled = !track.enabled;
+        track.enabled = !nextMuted;
       });
-      setIsAudioMuted(!isAudioMuted);
     }
   };
 
@@ -378,20 +399,57 @@ export const StudioView = ({
 
               {streamType === 'screen' && (
                 <div
-                  className="px-2.5 py-1.5 rounded-lg text-xs font-mono flex items-center gap-1.5 bg-[#1E1E26] border border-[#29292F] text-cerulean-bright"
-                  title="System audio from your PC/tab will stream to viewers"
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-mono flex items-center gap-1.5 border transition-all ${
+                    hasScreenAudio
+                      ? 'bg-cerulean/15 border-cerulean text-cerulean-bright'
+                      : 'bg-neon-rose/15 border-neon-rose text-neon-rose'
+                  }`}
+                  title={hasScreenAudio ? 'YouTube/system audio is active and streaming' : 'No screen audio track captured'}
                 >
-                  <span className="w-2 h-2 rounded-full bg-cerulean-bright animate-pulse" />
-                  <span>System Audio Enabled</span>
+                  <Volume2 className="w-3.5 h-3.5" />
+                  <span>{hasScreenAudio ? 'Tab Audio Active' : 'No Tab Audio'}</span>
                 </div>
               )}
             </div>
           </div>
 
           {streamType === 'screen' && (
-            <div className="px-4 py-2 rounded-xl bg-[#141418] border border-[#29292F] text-[11px] font-mono text-[#A1A1AA] flex items-center gap-2">
-              <span className="text-cerulean-bright font-bold">💡 Note:</span>
-              <span>To broadcast video or music sound, choose &ldquo;Entire Screen&rdquo; or &ldquo;Chrome Tab&rdquo; in the picker and ensure &ldquo;Also share system audio&rdquo; is checked at the bottom left.</span>
+            <div className="space-y-2">
+              {hasScreenAudio ? (
+                <div className="px-4 py-2.5 rounded-xl bg-[#141418] border border-cerulean/30 flex items-center justify-between text-xs font-mono">
+                  <div className="flex items-center gap-2 text-cerulean-bright font-bold">
+                    <span className="w-2 h-2 rounded-full bg-cerulean-bright animate-ping" />
+                    <span>Streaming YouTube / Tab Audio Live</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] text-[#A1A1AA] uppercase">Volume Level:</span>
+                    <div className="w-24 h-2 bg-[#0A0A0A] rounded-full overflow-hidden border border-[#29292F]">
+                      <div
+                        className="h-full bg-cerulean-bright transition-all duration-75"
+                        style={{ width: `${Math.min(100, Math.max(6, audioLevel * 300))}%` }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-3.5 rounded-xl bg-neon-rose/10 border border-neon-rose/30 space-y-2 text-xs font-mono">
+                  <div className="flex items-start gap-2 text-neon-rose font-bold">
+                    <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>YouTube / Tab Audio Not Captured! Viewers will not hear video voice.</span>
+                  </div>
+                  <p className="text-[11px] text-[#A1A1AA] leading-relaxed">
+                    When sharing a YouTube video in Google Chrome: Click <strong className="text-white">Chrome Tab</strong> and ensure <strong className="text-white">&ldquo;Share tab audio&rdquo;</strong> is enabled at the bottom.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => handleSwitchSource('screen', true)}
+                    className="px-3 py-1.5 rounded-lg bg-neon-rose/20 hover:bg-neon-rose/30 border border-neon-rose/50 text-neon-rose font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Re-select YouTube Tab with Audio</span>
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>

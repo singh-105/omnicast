@@ -75,6 +75,13 @@ export class StreamCapture {
     this.fallbackDrawTimer = null;
     this.fallbackCanvas = null;
     this.recorderGeneration = 0;
+    this.audioContext = null;
+    this._audioNodes = [];
+    this._audioStreams = [];
+    this.screenGain = null;
+    this.micGain = null;
+    this.audioAnalyser = null;
+    this.hasSystemAudio = false;
   }
 
   /**
@@ -145,6 +152,137 @@ export class StreamCapture {
   }
 
   /**
+   * Mixes system/screen audio (e.g. YouTube video playback) and optional microphone audio.
+   * Holds strong references to all Web Audio API nodes on the instance to prevent Chromium V8
+   * garbage collection from silencing audio streams.
+   */
+  async mixScreenAndMicAudio(screenStream, withMic = true) {
+    const screenAudioTracks = screenStream.getAudioTracks();
+    this.hasSystemAudio = screenAudioTracks.length > 0;
+    console.log(`[Capture] Screen capture audio tracks: ${screenAudioTracks.length} (System sound: ${this.hasSystemAudio ? 'ACTIVE' : 'NONE'})`);
+
+    this.cleanupAudioGraph();
+
+    if (!this.hasSystemAudio && !withMic) {
+      return screenStream;
+    }
+
+    const AudioCtx = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext);
+    if (!AudioCtx) {
+      return screenStream;
+    }
+
+    try {
+      this.audioContext = new AudioCtx({ latencyHint: 'interactive' });
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume();
+      }
+
+      const dest = this.audioContext.createMediaStreamDestination();
+      this._audioNodes = [dest];
+      this._audioStreams = [];
+
+      // 1. YouTube / System screen audio pass-through with dedicated volume and analyser
+      if (this.hasSystemAudio) {
+        const screenAudioStream = new MediaStream(screenAudioTracks);
+        this._audioStreams.push(screenAudioStream);
+        const screenSource = this.audioContext.createMediaStreamSource(screenAudioStream);
+        this.screenGain = this.audioContext.createGain();
+        this.screenGain.gain.value = 1.0;
+        screenSource.connect(this.screenGain);
+        this.screenGain.connect(dest);
+
+        try {
+          this.audioAnalyser = this.audioContext.createAnalyser();
+          this.audioAnalyser.fftSize = 64;
+          this.screenGain.connect(this.audioAnalyser);
+          this._audioNodes.push(this.audioAnalyser);
+        } catch (_) {}
+
+        this._audioNodes.push(screenSource, this.screenGain);
+      }
+
+      // 2. Microphone audio input (optional commentary)
+      if (withMic && navigator.mediaDevices?.getUserMedia) {
+        try {
+          const micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+          if (micStream.getAudioTracks().length > 0) {
+            this._audioStreams.push(micStream);
+            const micSource = this.audioContext.createMediaStreamSource(micStream);
+            this.micGain = this.audioContext.createGain();
+            this.micGain.gain.value = 0.9;
+            micSource.connect(this.micGain);
+            this.micGain.connect(dest);
+            this._audioNodes.push(micSource, this.micGain);
+          }
+        } catch (micErr) {
+          console.warn('[Capture] Could not capture microphone for screen mix:', micErr.message);
+        }
+      }
+
+      const mixedAudioTracks = dest.stream.getAudioTracks();
+      if (mixedAudioTracks.length > 0) {
+        return new MediaStream([
+          ...screenStream.getVideoTracks(),
+          ...mixedAudioTracks,
+        ]);
+      }
+    } catch (err) {
+      console.warn('[Capture] Web Audio API mixing error, falling back to raw screen stream:', err);
+    }
+
+    return screenStream;
+  }
+
+  cleanupAudioGraph() {
+    if (this._audioNodes && this._audioNodes.length > 0) {
+      this._audioNodes.forEach((node) => {
+        try {
+          if (node.disconnect) node.disconnect();
+        } catch (_) {}
+      });
+      this._audioNodes = [];
+    }
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      try {
+        this.audioContext.close();
+      } catch (_) {}
+      this.audioContext = null;
+    }
+    this._audioStreams = [];
+    this.screenGain = null;
+    this.micGain = null;
+    this.audioAnalyser = null;
+  }
+
+  setMicMuted(muted) {
+    if (this.micGain) {
+      this.micGain.gain.value = muted ? 0 : 0.9;
+    }
+  }
+
+  getAudioLevel() {
+    if (!this.audioAnalyser) return 0;
+    try {
+      const data = new Uint8Array(this.audioAnalyser.frequencyBinCount);
+      this.audioAnalyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        sum += data[i];
+      }
+      return sum / (data.length * 255);
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /**
    * Starts capturing screen with optional microphone mix.
    */
   async startScreen({ withMic = true } = {}) {
@@ -179,59 +317,7 @@ export class StreamCapture {
       });
     }
 
-    const screenAudioTracks = screenStream.getAudioTracks();
-    const hasScreenAudio = screenAudioTracks.length > 0;
-    console.log(`[Capture] Screen capture audio tracks: ${screenAudioTracks.length} (System sound: ${hasScreenAudio ? 'ACTIVE' : 'NONE'})`);
-
-    let finalStream = screenStream;
-
-    // If user also wants mic audio mixed into the screen broadcast
-    if (withMic && navigator.mediaDevices.getUserMedia) {
-      try {
-        const micStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true },
-        });
-
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (AudioCtx) {
-          if (this.audioContext) {
-            try { this.audioContext.close(); } catch (_) {}
-          }
-          this.audioContext = new AudioCtx();
-          if (this.audioContext.state === 'suspended') {
-            await this.audioContext.resume();
-          }
-          const dest = this.audioContext.createMediaStreamDestination();
-
-          // Mix system/screen audio if present
-          if (hasScreenAudio) {
-            const screenAudioStream = new MediaStream(screenAudioTracks);
-            const screenSource = this.audioContext.createMediaStreamSource(screenAudioStream);
-            const screenGain = this.audioContext.createGain();
-            screenGain.gain.value = 1.0;
-            screenSource.connect(screenGain);
-            screenGain.connect(dest);
-          }
-
-          // Mix mic audio
-          if (micStream.getAudioTracks().length > 0) {
-            const micSource = this.audioContext.createMediaStreamSource(micStream);
-            const micGain = this.audioContext.createGain();
-            micGain.gain.value = 0.9;
-            micSource.connect(micGain);
-            micGain.connect(dest);
-          }
-
-          finalStream = new MediaStream([
-            ...screenStream.getVideoTracks(),
-            ...dest.stream.getAudioTracks(),
-          ]);
-        }
-      } catch (e) {
-        console.warn('[Capture] Could not capture microphone for screen mix:', e.message);
-      }
-    }
-
+    const finalStream = await this.mixScreenAndMicAudio(screenStream, withMic);
     this.mediaStream = finalStream;
     this.attachTrackListeners(finalStream, 'screen');
     this.currentSourceType = 'screen';
@@ -404,8 +490,8 @@ export class StreamCapture {
    * Dynamic live source switching (Camera ↔ Screen Share) during a live broadcast.
    * Preserves continuous sequence numbering and session continuity.
    */
-  async switchSource({ type = 'camera', withMic = true, deviceId = null } = {}) {
-    if (type === this.currentSourceType && this.mediaStream && this.isRecording && !deviceId) {
+  async switchSource({ type = 'camera', withMic = true, deviceId = null, forceReselect = false } = {}) {
+    if (!forceReselect && type === this.currentSourceType && this.mediaStream && this.isRecording && !deviceId) {
       return { stream: this.mediaStream, type };
     }
 
@@ -445,53 +531,7 @@ export class StreamCapture {
         throw err;
       }
 
-      const screenAudioTracks = newStream.getAudioTracks();
-      const hasScreenAudio = screenAudioTracks.length > 0;
-      console.log(`[Capture] Switch to screen audio tracks: ${screenAudioTracks.length} (System sound: ${hasScreenAudio ? 'ACTIVE' : 'NONE'})`);
-
-      // Mix mic if requested
-      if (withMic && navigator.mediaDevices.getUserMedia) {
-        try {
-          const micStream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: true, noiseSuppression: true },
-          });
-          const AudioCtx = window.AudioContext || window.webkitAudioContext;
-          if (AudioCtx) {
-            if (this.audioContext) {
-              try { this.audioContext.close(); } catch (_) {}
-            }
-            this.audioContext = new AudioCtx();
-            if (this.audioContext.state === 'suspended') {
-              await this.audioContext.resume();
-            }
-            const dest = this.audioContext.createMediaStreamDestination();
-
-            // Mix system/screen audio
-            if (hasScreenAudio) {
-              const screenAudioStream = new MediaStream(screenAudioTracks);
-              const screenSource = this.audioContext.createMediaStreamSource(screenAudioStream);
-              const screenGain = this.audioContext.createGain();
-              screenGain.gain.value = 1.0;
-              screenSource.connect(screenGain);
-              screenGain.connect(dest);
-            }
-
-            // Mix mic audio
-            if (micStream.getAudioTracks().length > 0) {
-              const micSource = this.audioContext.createMediaStreamSource(micStream);
-              const micGain = this.audioContext.createGain();
-              micGain.gain.value = 0.9;
-              micSource.connect(micGain);
-              micGain.connect(dest);
-            }
-
-            newStream = new MediaStream([
-              ...newStream.getVideoTracks(),
-              ...dest.stream.getAudioTracks(),
-            ]);
-          }
-        } catch (_) {}
-      }
+      newStream = await this.mixScreenAndMicAudio(newStream, withMic);
     } else {
       // Switch back to Camera (or switch camera device)
       const videoConfig = {
@@ -823,15 +863,12 @@ export class StreamCapture {
 
   cleanup() {
     this.stopEpochTimer();
+    this.cleanupAudioGraph();
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((t) => {
         try { t.stop(); } catch (_) {}
       });
       this.mediaStream = null;
-    }
-    if (this.audioContext) {
-      try { this.audioContext.close(); } catch (_) {}
-      this.audioContext = null;
     }
     this.isRecording = false;
   }
