@@ -34,6 +34,12 @@ export const WatcherView = ({
   const [connectionState, setConnectionState] = useState('connecting'); // 'connecting' | 'preparing' | 'playing' | 'buffering' | 'ended' | 'not_found' | 'error' | 'full'
   const [errorMessage, setErrorMessage] = useState('');
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [debugMode] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return new URLSearchParams(window.location.search).get('debug') === '1';
+    } catch (_) { return false; }
+  });
 
   // Prevent stale closure in event handlers
   const connectionStateRef = useRef(connectionState);
@@ -64,16 +70,26 @@ export const WatcherView = ({
       });
 
       const video = videoRef.current;
+      let waitingDebounce = null;
 
       const handlePlaying = () => {
+        if (waitingDebounce) {
+          clearTimeout(waitingDebounce);
+          waitingDebounce = null;
+        }
         setConnectionState('playing');
         setIsPlaying(true);
         setAutoplayBlocked(false);
       };
 
       const handleWaiting = () => {
-        if (connectionStateRef.current === 'playing') {
-          setConnectionState('buffering');
+        if (connectionStateRef.current === 'playing' && !waitingDebounce) {
+          waitingDebounce = setTimeout(() => {
+            waitingDebounce = null;
+            if (connectionStateRef.current === 'playing' || connectionStateRef.current === 'buffering') {
+              setConnectionState('buffering');
+            }
+          }, 600);
         }
       };
 
@@ -87,8 +103,14 @@ export const WatcherView = ({
       broadcastManager.onStateChange = (state, newMetrics) => {
         if (originalOnStateChange) originalOnStateChange(state, newMetrics);
 
-        if (state === 'streaming' && connectionStateRef.current === 'connecting') {
-          setConnectionState('preparing');
+        if (state === 'streaming') {
+          if (connectionStateRef.current === 'connecting') {
+            setConnectionState('preparing');
+          } else if (connectionStateRef.current === 'buffering') {
+            if (videoRef.current && !videoRef.current.paused && videoRef.current.readyState >= 2) {
+              setConnectionState('playing');
+            }
+          }
         } else if (state === 'full') {
           setConnectionState('full');
           setErrorMessage('Stream is at capacity (maximum viewer limit reached)');
@@ -483,6 +505,30 @@ export const WatcherView = ({
                 {metrics.selectedCandidateType || 'unknown'}
               </span>
             </div>
+
+            {/* ?debug=1 — detailed ICE candidate type per link */}
+            {debugMode && (
+              <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] space-y-2">
+                <span className="text-[10px] text-[#A1A1AA] uppercase font-bold">Debug: ICE Candidate Types</span>
+                <div className="space-y-1">
+                  {metrics.parentPeerId && (
+                    <div className="flex items-center justify-between text-[11px] py-0.5">
+                      <span className="text-white font-mono">↑ Parent {metrics.parentPeerId.slice(-8)}</span>
+                      <span className="text-cerulean-bright font-bold">{metrics.selectedCandidateType || '?'}</span>
+                    </div>
+                  )}
+                  {metrics.childLinks && metrics.childLinks.map((child, idx) => (
+                    <div key={`ice-${idx}`} className="flex items-center justify-between text-[11px] py-0.5">
+                      <span className="text-white font-mono">↓ Child {child.peerId.slice(-8)}</span>
+                      <span className="text-cerulean-bright font-bold">{child.candidateType || '?'}</span>
+                    </div>
+                  ))}
+                  {(!metrics.parentPeerId && (!metrics.childLinks || metrics.childLinks.length === 0)) && (
+                    <span className="text-[#A1A1AA] text-[10px]">No active links</span>
+                  )}
+                </div>
+              </div>
+            )}
 
             {/* Downstream Children Diagnostics */}
             {metrics.childLinks && metrics.childLinks.length > 0 && (

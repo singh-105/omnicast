@@ -34,6 +34,31 @@ export const StudioView = ({
   const [durationSecs, setDurationSecs] = useState(0);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [localMetrics, setLocalMetrics] = useState(metrics || {});
+  const [availableCameras, setAvailableCameras] = useState([]);
+  const [selectedCameraId, setSelectedCameraId] = useState('');
+
+  // Discover and enumerate available cameras
+  useEffect(() => {
+    async function loadCameras() {
+      if (navigator.mediaDevices?.enumerateDevices) {
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const videoInputs = devices.filter((d) => d.kind === 'videoinput');
+          setAvailableCameras(videoInputs);
+          if (videoInputs.length > 0 && !selectedCameraId) {
+            // Prioritize standard color webcams over Windows Hello IR sensors
+            const nonIr = videoInputs.find((d) => d.label && !/ir\b|infrared/i.test(d.label));
+            setSelectedCameraId(nonIr ? nonIr.deviceId : videoInputs[0].deviceId);
+          }
+        } catch (_) {}
+      }
+    }
+    loadCameras();
+    if (navigator.mediaDevices) {
+      navigator.mediaDevices.addEventListener('devicechange', loadCameras);
+      return () => navigator.mediaDevices.removeEventListener('devicechange', loadCameras);
+    }
+  }, []);
 
   useEffect(() => {
     if (!broadcastManager) return;
@@ -103,12 +128,34 @@ export const StudioView = ({
         title: streamTitle,
         type: streamType,
         maxChildren,
+        deviceId: streamType === 'camera' ? selectedCameraId : null,
       });
       setActiveStream(res.stream);
       setIsLive(true);
+      // Re-enumerate to get fresh device labels once permission is active
+      if (navigator.mediaDevices?.enumerateDevices) {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoInputs = devices.filter((d) => d.kind === 'videoinput');
+        setAvailableCameras(videoInputs);
+      }
     } catch (err) {
       console.error('[Studio] Start broadcast error:', err);
       setErrorMsg(err.message || 'Failed to start broadcast');
+    }
+  };
+
+  const handleCameraChange = async (newDeviceId) => {
+    setSelectedCameraId(newDeviceId);
+    if (isLive && streamType === 'camera') {
+      try {
+        const res = await broadcastManager.switchSource({ type: 'camera', deviceId: newDeviceId });
+        if (res?.stream) {
+          setActiveStream(res.stream);
+        }
+      } catch (err) {
+        console.warn('[Studio] Camera switch error:', err);
+        setErrorMsg(`Failed to switch camera: ${err.message}`);
+      }
     }
   };
 
@@ -132,7 +179,10 @@ export const StudioView = ({
 
     if (isLive) {
       try {
-        const res = await broadcastManager.switchSource({ type: newType });
+        const res = await broadcastManager.switchSource({
+          type: newType,
+          deviceId: newType === 'camera' ? selectedCameraId : null,
+        });
         if (res) {
           setStreamType(res.type);
           setActiveStream(res.stream);
@@ -281,6 +331,21 @@ export const StudioView = ({
                 <Video className="w-3.5 h-3.5" />
                 <span>Camera</span>
               </button>
+
+              {streamType === 'camera' && availableCameras.length > 1 && (
+                <select
+                  value={selectedCameraId}
+                  onChange={(e) => handleCameraChange(e.target.value)}
+                  className="px-2.5 py-1.5 rounded-lg text-xs font-mono bg-[#1E1E26] text-white border border-[#29292F] focus:border-cerulean outline-none cursor-pointer max-w-[200px] truncate"
+                  title="Select Camera Device"
+                >
+                  {availableCameras.map((cam, idx) => (
+                    <option key={cam.deviceId || idx} value={cam.deviceId}>
+                      {cam.label || `Camera ${idx + 1}`}
+                    </option>
+                  ))}
+                </select>
+              )}
 
               <button
                 type="button"

@@ -43,7 +43,10 @@ export function getSupportedMimeType({ hasAudio = true } = {}) {
   return '';
 }
 
-export const KEYFRAME_EPOCH_MS = 8000;
+export const KEYFRAME_EPOCH_MS =
+  (typeof import.meta !== 'undefined' && import.meta.env?.VITE_KEYFRAME_EPOCH_MS)
+    ? Number(import.meta.env.VITE_KEYFRAME_EPOCH_MS)
+    : 8000;
 
 export class StreamCapture {
   constructor({ onChunk, onError, onStop, onSourceReverted, keyframeEpochMs = KEYFRAME_EPOCH_MS } = {}) {
@@ -77,20 +80,36 @@ export class StreamCapture {
   /**
    * Starts capturing camera & microphone.
    */
-  async startCamera({ video = true, audio = true, resolution = '720p' } = {}) {
+  async startCamera({ video = true, audio = true, resolution = '720p', deviceId = null } = {}) {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error('Camera/Microphone capture is not supported in this browser');
     }
 
     const is540p = resolution === '540p';
+    let videoConstraint = video
+      ? {
+          width: is540p ? { ideal: 960, max: 960 } : { ideal: 1280, max: 1280 },
+          height: is540p ? { ideal: 540, max: 540 } : { ideal: 720, max: 720 },
+          frameRate: { ideal: 30, max: 30 },
+        }
+      : false;
+
+    if (deviceId && videoConstraint) {
+      videoConstraint.deviceId = { ideal: deviceId };
+    } else if (video && navigator.mediaDevices?.enumerateDevices) {
+      // Prefer standard RGB color webcams over Windows Hello / IR sensor devices
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter((d) => d.kind === 'videoinput');
+        const rgbCamera = videoDevices.find((d) => d.label && !/ir\b|infrared/i.test(d.label));
+        if (rgbCamera && rgbCamera.deviceId) {
+          videoConstraint.deviceId = { ideal: rgbCamera.deviceId };
+        }
+      } catch (_) {}
+    }
+
     const constraints = {
-      video: video
-        ? {
-            width: is540p ? { ideal: 960, max: 960 } : { ideal: 1280, max: 1280 },
-            height: is540p ? { ideal: 540, max: 540 } : { ideal: 720, max: 720 },
-            frameRate: { ideal: 30, max: 30 },
-          }
-        : false,
+      video: videoConstraint,
       audio: audio
         ? {
             echoCancellation: true,
@@ -348,8 +367,8 @@ export class StreamCapture {
    * Dynamic live source switching (Camera ↔ Screen Share) during a live broadcast.
    * Preserves continuous sequence numbering and session continuity.
    */
-  async switchSource({ type = 'camera', withMic = true } = {}) {
-    if (type === this.currentSourceType && this.mediaStream && this.isRecording) {
+  async switchSource({ type = 'camera', withMic = true, deviceId = null } = {}) {
+    if (type === this.currentSourceType && this.mediaStream && this.isRecording && !deviceId) {
       return { stream: this.mediaStream, type };
     }
 
@@ -403,11 +422,26 @@ export class StreamCapture {
         } catch (_) {}
       }
     } else {
-      // Switch back to Camera
-      newStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 }, frameRate: { ideal: 30, max: 30 } },
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
+      // Switch back to Camera (or switch camera device)
+      const videoConfig = {
+        width: { ideal: 1280, max: 1920 },
+        height: { ideal: 720, max: 1080 },
+        frameRate: { ideal: 30, max: 30 },
+      };
+      if (deviceId) {
+        videoConfig.deviceId = { ideal: deviceId };
+      }
+      try {
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: videoConfig,
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      } catch (_) {
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: Boolean(deviceId ? { deviceId: { ideal: deviceId } } : true),
+          audio: { echoCancellation: true, noiseSuppression: true },
+        });
+      }
     }
 
     this.isSwitchingSource = true;

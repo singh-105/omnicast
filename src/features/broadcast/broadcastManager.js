@@ -232,7 +232,7 @@ export class BroadcastManager {
   // BROADCASTER WORKFLOW (Origin)
   // ──────────────────────────────────────────────────────────
 
-  async startBroadcast({ title = 'OmniCast Live Stream', type = 'camera', maxChildren = null } = {}) {
+  async startBroadcast({ title = 'OmniCast Live Stream', type = 'camera', maxChildren = null, deviceId = null } = {}) {
     this.role = 'broadcaster';
     this.tier = 0;
     this.metrics.tier = 0;
@@ -274,7 +274,7 @@ export class BroadcastManager {
     if (type === 'screen') {
       captureResult = await this.streamCapture.startScreen({ withMic: true });
     } else {
-      captureResult = await this.streamCapture.startCamera({ video: true, audio: true });
+      captureResult = await this.streamCapture.startCamera({ video: true, audio: true, deviceId });
     }
 
     this.streamMimeType = captureResult.mimeType;
@@ -297,11 +297,11 @@ export class BroadcastManager {
     };
   }
 
-  async switchSource({ type = 'camera' } = {}) {
+  async switchSource({ type = 'camera', deviceId = null } = {}) {
     if (!this.streamCapture) {
       throw new Error('No active stream capture to switch');
     }
-    const result = await this.streamCapture.switchSource({ type });
+    const result = await this.streamCapture.switchSource({ type, deviceId });
     if (!result) return null;
 
     if (this.onStreamChanged) {
@@ -530,21 +530,25 @@ export class BroadcastManager {
     this.upstreamWatchdogTimer = setInterval(() => {
       if (this.role !== 'viewer' || !this.broadcastId) return;
       if (!this.parentLink) return;
-      if (Date.now() - this.lastPacketAt < 4000) return;
+      const silentMs = Date.now() - this.lastPacketAt;
+      if (silentMs < 7000) return;
 
       this.bootstrapRetryCount++;
       if (this.parentLink.isOpen()) {
         this.parentLink.sendControl({ type: 'bootstrap-req' });
       }
-      this.updateState('reconnecting');
 
-      if (this.bootstrapRetryCount >= 3) {
-        const parentPeerId = this.parentLink.remotePeerId;
+      if (silentMs > 12000) {
+        this.updateState('reconnecting');
+      }
+
+      if (this.bootstrapRetryCount >= 4 || silentMs > 18000) {
+        console.warn(`[BroadcastManager] Upstream watchdog: ${silentMs}ms silent, triggering failover...`);
         this.bootstrapRetryCount = 0;
         this.lastPacketAt = Date.now();
-        this.connectToParent(parentPeerId);
+        this.triggerFailover();
       }
-    }, 2500);
+    }, 3000);
   }
 
   /**
@@ -553,6 +557,7 @@ export class BroadcastManager {
   handleIncomingBinary(arrayBuffer) {
     if (!(arrayBuffer instanceof ArrayBuffer)) return;
     this.lastPacketAt = Date.now();
+    this.bootstrapRetryCount = 0;
     this.incomingPacketQueue.push(arrayBuffer);
     void this.processIncomingPacketQueue();
   }
@@ -562,14 +567,7 @@ export class BroadcastManager {
     this.msePlayer = new MsePlayer({
       videoElement: this.videoElement,
       mimeType: this.streamMimeType,
-      onError: (err) => {
-        console.warn('[BroadcastManager] MsePlayer error, resetting playback for resync:', err.message);
-        this.resetPlaybackForResync();
-        if (this.parentLink && this.parentLink.isOpen()) {
-          this.parentLink.sendControl({ type: 'bootstrap-req' });
-        }
-        if (this.onError) this.onError(err);
-      },
+      onError: (err) => this.onError && this.onError(err),
       onLiveStateChange: (state) => {
         if (this.onLiveStateChange) this.onLiveStateChange(state);
       },
@@ -619,6 +617,7 @@ export class BroadcastManager {
       }
 
       this.metrics.chunksReceived++;
+      this.bootstrapRetryCount = 0;
 
       // Verify origin ECDSA P-256 signature before playback or forwarding
       if (this.originPublicKey) {
@@ -1091,6 +1090,7 @@ export class BroadcastManager {
         open: link.isOpen(),
         hasSynced: Boolean(link._hasSynced),
         queuedPackets: link.pendingQueue ? link.pendingQueue.length : 0,
+        candidateType: link.selectedCandidateType || link.stats?.selectedCandidateType || 'unknown',
       }));
 
       this.metrics.lastPacketAtAgeMs = this.lastPacketAt ? Math.max(0, Date.now() - this.lastPacketAt) : null;

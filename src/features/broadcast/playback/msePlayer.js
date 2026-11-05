@@ -339,20 +339,20 @@ export class MsePlayer {
       const bufferedEnd = this.videoElement.buffered.end(this.videoElement.buffered.length - 1);
       const lag = bufferedEnd - this.videoElement.currentTime;
 
-      // Keep player tightly near the live edge without stuttering
-      if (lag > 1.4) {
-        // High latency detected: jump immediately to live edge
-        this.videoElement.currentTime = Math.max(0, bufferedEnd - 0.35);
+      // Keep player tightly near the live edge with smooth playback rate adaptation (avoid constant seek stutters)
+      if (lag > 3.5) {
+        // Only jump if severely lagging behind (> 3.5 seconds)
+        this.videoElement.currentTime = Math.max(0, bufferedEnd - 0.7);
         this.videoElement.playbackRate = 1.0;
+      } else if (lag > 1.4) {
+        // Gentle catch-up without seek or audio pitch distortion
+        this.videoElement.playbackRate = 1.10;
       } else if (lag > 0.7) {
-        // Moderate latency: catch up smoothly without audio pitch distortion
-        this.videoElement.playbackRate = 1.06;
-      } else if (lag > 0.35) {
-        // Optimal live edge range
+        this.videoElement.playbackRate = 1.05;
+      } else if (lag > 0.3) {
         this.videoElement.playbackRate = 1.0;
       } else if (lag < 0.15) {
-        // Near underrun: slight throttle to allow buffer cushion
-        this.videoElement.playbackRate = 0.98;
+        this.videoElement.playbackRate = 0.96;
       }
     } catch (_) {}
   }
