@@ -33,6 +33,24 @@ export const StudioView = ({
   const [isAudioMuted, setIsAudioMuted] = useState(false);
   const [durationSecs, setDurationSecs] = useState(0);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [localMetrics, setLocalMetrics] = useState(metrics || {});
+
+  useEffect(() => {
+    if (!broadcastManager) return;
+    const orig = broadcastManager.onMetrics;
+    broadcastManager.onMetrics = (m) => {
+      if (orig) orig(m);
+      setLocalMetrics({ ...m });
+    };
+    return () => {
+      broadcastManager.onMetrics = orig;
+    };
+  }, [broadcastManager]);
+
+  const displayMetrics = { ...metrics, ...localMetrics, ...(broadcastManager?.metrics || {}) };
+
+  const urlParams = new URLSearchParams(typeof window !== 'undefined' ? window.location.search : '');
+  const maxChildren = parseInt(urlParams.get('maxChildren') || '5', 10);
 
   const localVideoRef = useRef(null);
 
@@ -342,7 +360,7 @@ export const StudioView = ({
                 </span>
                 <span className="text-xs font-mono text-neon-rose font-bold flex items-center gap-1">
                   <Users className="w-3.5 h-3.5" />
-                  {metrics.viewerCount || 0} Viewers
+                  {displayMetrics.viewerCount || 0} Viewers
                 </span>
               </div>
 
@@ -350,7 +368,7 @@ export const StudioView = ({
                 <div className="p-3 rounded-xl bg-cerulean/10 border border-cerulean/20 text-[11px] font-mono text-cerulean-bright flex items-start gap-2">
                   <Globe className="w-4 h-4 shrink-0 mt-0.5 text-cerulean-bright" />
                   <span className="leading-relaxed">
-                    Local Network Link · Viewers on this computer or LAN can join. For internet audiences, share from your public domain or tunnel.
+                    Local Network Link · Audience on this computer or LAN can join. For internet audiences, share from your public domain or tunnel.
                   </span>
                 </div>
               )}
@@ -378,11 +396,11 @@ export const StudioView = ({
             <div className="grid grid-cols-2 gap-3 text-xs font-mono">
               <div className="p-3.5 rounded-xl border border-[#29292F] bg-[#141418] space-y-1">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Audience</span>
-                <p className="text-base font-bold text-white">{metrics.viewerCount || 0} watching</p>
+                <p className="text-base font-bold text-white">{displayMetrics.viewerCount || 0} watching</p>
               </div>
               <div className="p-3.5 rounded-xl border border-[#29292F] bg-[#141418] space-y-1">
                 <span className="text-[10px] text-[#A1A1AA] uppercase">Direct Children</span>
-                <p className="text-base font-bold text-cerulean-bright">{metrics.activeChildren} / 5 max</p>
+                <p className="text-base font-bold text-cerulean-bright">{displayMetrics.activeChildren || 0} / {maxChildren} max</p>
               </div>
             </div>
           )}
@@ -408,29 +426,29 @@ export const StudioView = ({
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                   <span className="text-[10px] text-[#A1A1AA] uppercase">Upload Rate</span>
-                  <p className="text-sm font-bold text-cerulean-bright mt-0.5">{metrics.bitrateKbps} kbps</p>
+                  <p className="text-sm font-bold text-cerulean-bright mt-0.5">{displayMetrics.bitrateKbps || 0} kbps</p>
                 </div>
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                   <span className="text-[10px] text-[#A1A1AA] uppercase">Emitted Chunks</span>
-                  <p className="text-sm font-bold text-white mt-0.5">{metrics.chunksEmitted}</p>
+                  <p className="text-sm font-bold text-white mt-0.5">{displayMetrics.chunksEmitted || 0}</p>
                 </div>
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                   <span className="text-[10px] text-[#A1A1AA] uppercase">Bytes Out</span>
-                  <p className="text-sm font-bold text-white mt-0.5">{(metrics.bytesSent / 1024).toFixed(1)} KB</p>
+                  <p className="text-sm font-bold text-white mt-0.5">{((displayMetrics.bytesSent || 0) / 1024).toFixed(1)} KB</p>
                 </div>
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F]">
                   <span className="text-[10px] text-[#A1A1AA] uppercase">Mesh Fanout</span>
-                  <p className="text-sm font-bold text-white mt-0.5">{metrics.activeChildren} Tier-1 Nodes</p>
+                  <p className="text-sm font-bold text-white mt-0.5">{displayMetrics.activeChildren || 0} Tier-1 Nodes</p>
                 </div>
               </div>
 
-              {metrics.fingerprint && (
+              {(displayMetrics.fingerprint || broadcastManager.originFingerprint) && (
                 <div className="p-3 rounded-lg bg-[#0A0A0A] border border-[#29292F] space-y-1">
                   <div className="flex items-center gap-1.5 text-cerulean-bright">
                     <ShieldCheck className="w-3.5 h-3.5" />
                     <span className="font-bold text-[10px] uppercase">ECDSA P-256 Origin Fingerprint</span>
                   </div>
-                  <p className="text-[11px] text-[#A1A1AA] break-all select-all">{metrics.fingerprint}</p>
+                  <p className="text-[11px] text-[#A1A1AA] break-all select-all">{displayMetrics.fingerprint || broadcastManager.originFingerprint}</p>
                 </div>
               )}
             </div>

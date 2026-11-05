@@ -156,6 +156,9 @@ export default function App() {
     });
 
     broadcastManagerRef.current = manager;
+    if (typeof window !== 'undefined') {
+      window.__OMNICAST_MANAGER__ = manager;
+    }
 
     manager.connectSignaling().then(() => {
       fetchActiveBroadcasts();

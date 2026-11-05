@@ -43,12 +43,16 @@ export function getSupportedMimeType({ hasAudio = true } = {}) {
   return '';
 }
 
+export const KEYFRAME_EPOCH_MS = 8000;
+
 export class StreamCapture {
-  constructor({ onChunk, onError, onStop, onSourceReverted } = {}) {
+  constructor({ onChunk, onError, onStop, onSourceReverted, keyframeEpochMs = KEYFRAME_EPOCH_MS } = {}) {
     this.onChunk = onChunk; // (chunkObject) => void
     this.onError = onError;
     this.onStop = onStop;
     this.onSourceReverted = onSourceReverted; // (newType, newStream) => void
+    this.keyframeEpochMs = keyframeEpochMs;
+    this.epochInterval = null;
 
     this.mediaStream = null;
     this.mediaRecorder = null;
@@ -496,20 +500,83 @@ export class StreamCapture {
           return;
         }
 
-        const isInitChunk = this.isFirstChunkOfRecorder;
-        this.isFirstChunkOfRecorder = false;
+        if (this.isFirstChunkOfRecorder) {
+          this.isFirstChunkOfRecorder = false;
 
-        // The first emitted chunk of the recorder contains the initialization segment
-        if (isInitChunk) {
-          this.initSegment = payloadBytes;
+          // Split the very first recorder burst into:
+          // 1. Pure EBML container init segment (0 to clusterIdx)
+          // 2. First Matroska Cluster with initial VP8/H.264 keyframe (clusterIdx to end)
+          let clusterIdx = -1;
+          for (let i = 0; i < payloadBytes.length - 4; i++) {
+            if (
+              payloadBytes[i] === 0x1f &&
+              payloadBytes[i + 1] === 0x43 &&
+              payloadBytes[i + 2] === 0xb6 &&
+              payloadBytes[i + 3] === 0x75
+            ) {
+              clusterIdx = i;
+              break;
+            }
+          }
+
+          if (clusterIdx > 0) {
+            const initHeader = payloadBytes.slice(0, clusterIdx);
+            const firstCluster = payloadBytes.slice(clusterIdx);
+
+            this.initSegment = initHeader;
+
+            // Emit Init Segment (seq 0)
+            const initChunk = {
+              sequence: this.sequence,
+              timestamp: Date.now(),
+              isInit: true,
+              isKeyframe: false,
+              payload: initHeader,
+              mimeType: this.mimeType,
+            };
+            this.sequence++;
+            if (this.onChunk) {
+              this.onChunk(initChunk);
+            }
+
+            // Emit First Keyframe Chunk (seq 1)
+            const keyframeChunk = {
+              sequence: this.sequence,
+              timestamp: Date.now(),
+              isInit: false,
+              isKeyframe: true,
+              payload: firstCluster,
+              mimeType: this.mimeType,
+            };
+            this.sequence++;
+            if (this.onChunk) {
+              this.onChunk(keyframeChunk);
+            }
+            return;
+          } else {
+            // Fallback if no cluster found in first burst
+            this.initSegment = payloadBytes;
+            this.isNextChunkKeyframe = true;
+            const initChunk = {
+              sequence: this.sequence,
+              timestamp: Date.now(),
+              isInit: true,
+              isKeyframe: false,
+              payload: payloadBytes,
+              mimeType: this.mimeType,
+            };
+            this.sequence++;
+            if (this.onChunk) {
+              this.onChunk(initChunk);
+            }
+            return;
+          }
         }
 
         let isKeyframe = false;
-        if (isInitChunk) {
-          isKeyframe = false; // EBML container header is an init segment, not a video keyframe
-        } else if (this.isSecondChunkOfNewSource || this.sequence === 1) {
-          // The first video chunk following container header is always an independent keyframe
+        if (this.isNextChunkKeyframe || this.isSecondChunkOfNewSource || this.sequence === 1) {
           isKeyframe = true;
+          this.isNextChunkKeyframe = false;
           this.isSecondChunkOfNewSource = false;
         } else {
           isKeyframe = this.probeKeyframe(payloadBytes);
@@ -518,7 +585,7 @@ export class StreamCapture {
         const chunkObj = {
           sequence: this.sequence,
           timestamp: Date.now(),
-          isInit: isInitChunk,
+          isInit: false,
           isKeyframe,
           payload: payloadBytes,
           mimeType: this.mimeType,
@@ -548,9 +615,13 @@ export class StreamCapture {
       }
     };
 
-    // Start recording in ~500 ms chunks
+    // Start recording in ~300 ms chunks
     this.mediaRecorder.start(this.timesliceMs);
     this.isRecording = true;
+
+    if (!isSourceSwitch) {
+      this.startEpochTimer();
+    }
 
     return {
       stream: this.mediaStream,
@@ -558,17 +629,62 @@ export class StreamCapture {
     };
   }
 
+  startEpochTimer() {
+    this.stopEpochTimer();
+    this.epochInterval = setInterval(() => {
+      this.restartEpoch();
+    }, this.keyframeEpochMs);
+  }
+
+  stopEpochTimer() {
+    if (this.epochInterval) {
+      clearInterval(this.epochInterval);
+      this.epochInterval = null;
+    }
+  }
+
+  restartEpoch() {
+    if (!this.isRecording || this.isSwitchingSource || !this.mediaStream) return;
+    const tracks = this.mediaStream.getVideoTracks();
+    if (tracks.length === 0 || tracks[0].readyState !== 'live') return;
+    console.log(`[Capture] Starting fresh keyframe epoch (${this.keyframeEpochMs}ms elapsed)`);
+    this.isSwitchingSource = true;
+    if (this.mediaRecorder) {
+      this.mediaRecorder.ondataavailable = null;
+      this.mediaRecorder.onerror = null;
+      this.mediaRecorder.onstop = null;
+      if (this.mediaRecorder.state !== 'inactive') {
+        try { this.mediaRecorder.stop(); } catch (_) {}
+      }
+    }
+    // Do NOT stop tracks of this.mediaStream! Keep active captured tracks live.
+    this.stashedFirstChunk = null;
+    this.initRecorder(this.mediaStream, /* isSourceSwitch= */ true);
+    this.isSwitchingSource = false;
+  }
+
   /**
-   * Inspects bytes to accurately determine if chunk contains a VP8 video keyframe.
+   * Inspects bytes to accurately determine if chunk contains a VP8/H.264 video keyframe.
    * Matches the official VP8 uncompressed header start code (0x9D 0x01 0x2A) preceded by keyframe tag (bit 0 == 0).
    */
   probeKeyframe(bytes) {
     if (!bytes || bytes.length < 16) return false;
-
-    // Timeslice blobs are not guaranteed to begin at an EBML cluster
-    // boundary. The first media chunk of each recorder epoch is marked
-    // explicitly above; uncertain later blobs stay delta frames so bootstrap
-    // never starts from a false keyframe inside compressed data.
+    // Check for VP8 start code 0x9D 0x01 0x2A with bit 0 == 0
+    for (let i = 0; i < Math.min(bytes.length - 6, 256); i++) {
+      if (bytes[i + 3] === 0x9d && bytes[i + 4] === 0x01 && bytes[i + 5] === 0x2a) {
+        if ((bytes[i] & 0x01) === 0) {
+          return true;
+        }
+      }
+    }
+    // Check for H.264 NAL type 5 (IDR) or 7 (SPS)
+    for (let i = 0; i < Math.min(bytes.length - 5, 256); i++) {
+      if (bytes[i] === 0x00 && bytes[i + 1] === 0x00 && (bytes[i + 2] === 0x01 || (bytes[i + 2] === 0x00 && bytes[i + 3] === 0x01))) {
+        const nalIndex = bytes[i + 2] === 0x01 ? i + 3 : i + 4;
+        const nalType = bytes[nalIndex] & 0x1f;
+        if (nalType === 5 || nalType === 7) return true;
+      }
+    }
     return false;
   }
 
@@ -585,6 +701,7 @@ export class StreamCapture {
   }
 
   stop() {
+    this.stopEpochTimer();
     if (this.cameraRecoveryTimer) {
       clearTimeout(this.cameraRecoveryTimer);
       this.cameraRecoveryTimer = null;
@@ -600,6 +717,7 @@ export class StreamCapture {
   }
 
   cleanup() {
+    this.stopEpochTimer();
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((t) => {
         try { t.stop(); } catch (_) {}

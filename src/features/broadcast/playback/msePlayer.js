@@ -116,6 +116,15 @@ export class MsePlayer {
    */
   onGapOccurred() {
     this.waitingForKeyframe = true;
+    if (this._keyframeTimeout) clearTimeout(this._keyframeTimeout);
+    this._keyframeTimeout = setTimeout(() => {
+      this._keyframeTimeout = null;
+      if (this.waitingForKeyframe) {
+        console.warn('[MSE] Keyframe wait timed out after 3s; resuming decode and requesting bootstrap.');
+        this.waitingForKeyframe = false;
+        if (this.onNeedBootstrap) this.onNeedBootstrap();
+      }
+    }, 3000);
     console.warn('[MSE] Transport gap detected: quarantining delta frames until clean keyframe arrives to prevent ghosting.');
   }
 
@@ -133,47 +142,47 @@ export class MsePlayer {
       : chunkBytes;
 
     if (isInit) {
+      if (this._keyframeTimeout) {
+        clearTimeout(this._keyframeTimeout);
+        this._keyframeTimeout = null;
+      }
+      this.waitingForKeyframe = false;
       if (!this.hasInitSegment) {
         this.hasInitSegment = true;
-        this.hasFirstKeyframe = false; // Must wait for first decodable keyframe
-        this.allowPreKeyframeData = true;
-        this.waitingForKeyframe = false;
-        this.appendQueue.unshift(buffer);
+        this.hasFirstKeyframe = false;
+        this.allowPreKeyframeData = false;
+        this.lastAppendedInitSize = buffer.byteLength;
+        // Clean out any rogue packets that arrived before the stream init header
+        this.appendQueue = [buffer];
       } else {
-        // Source switch or new epoch: append new track header in order with offset
-        this.hasFirstKeyframe = false; // Reset to wait for clean keyframe from new source
-        this.allowPreKeyframeData = true;
-        this.waitingForKeyframe = false;
-        this.appendQueue.push({ isInitHeader: true, buffer });
+        this.lastAppendedInitSize = buffer.byteLength;
+        this.hasFirstKeyframe = false;
+        this.allowPreKeyframeData = false;
+        // Clean out trailing delta frames from the old epoch before pushing new header
+        this.appendQueue = [{ isInitHeader: true, buffer }];
       }
       this.processAppendQueue();
       return;
     }
 
-    // A decoder cannot decode delta frames before its first keyframe arrives!
-    if (!this.hasFirstKeyframe) {
-      if (!isKeyframe) {
-        // Keep the WebM cluster context for a late joiner. The bootstrap
-        // sender supplies a bounded contiguous window after the init segment;
-        // dropping those pre-keyframe clusters can make a later keyframe
-        // undecodable even though the bytes themselves arrived intact.
-        if (!this.allowPreKeyframeData) return;
-        this.appendQueue.push(buffer);
-        this.processAppendQueue();
-        return;
+    if (isKeyframe) {
+      if (this._keyframeTimeout) {
+        clearTimeout(this._keyframeTimeout);
+        this._keyframeTimeout = null;
       }
       this.hasFirstKeyframe = true;
-      this.allowPreKeyframeData = false;
       this.waitingForKeyframe = false;
+      this.allowPreKeyframeData = false;
     }
 
-    // If waiting for a keyframe after a sequence gap, drop delta frames to prevent decoder ghosting/corruption!
+    // A decoder cannot decode delta frames before its first keyframe arrives!
+    if (!this.hasFirstKeyframe) {
+      return;
+    }
+
+    // If waiting for a keyframe after a sequence gap, drop delta frames until clean keyframe arrives
     if (this.waitingForKeyframe) {
-      if (!isKeyframe) {
-        return; // Drop corrupted delta frame until clean keyframe arrives
-      }
-      console.log('[MSE] Clean keyframe arrived after gap, resuming decode.');
-      this.waitingForKeyframe = false;
+      return;
     }
 
     this.appendQueue.push(buffer);
@@ -189,6 +198,14 @@ export class MsePlayer {
       this.isAppending ||
       this.appendQueue.length === 0
     ) {
+      return;
+    }
+
+    if (this.videoElement && this.videoElement.error) {
+      console.warn('[MSE] videoElement has error:', this.videoElement.error.message || this.videoElement.error.code);
+      if (this.onError) {
+        this.onError(new Error(`Video element error ${this.videoElement.error.code}`));
+      }
       return;
     }
 
@@ -369,6 +386,14 @@ export class MsePlayer {
 
   destroy() {
     this.isDestroyed = true;
+    if (this._keyframeTimeout) {
+      clearTimeout(this._keyframeTimeout);
+      this._keyframeTimeout = null;
+    }
+    if (this.watchdogInterval) {
+      clearInterval(this.watchdogInterval);
+      this.watchdogInterval = null;
+    }
     clearInterval(this.pruneInterval);
     clearInterval(this.driftInterval);
     this.appendQueue = [];

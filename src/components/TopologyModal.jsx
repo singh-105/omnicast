@@ -14,8 +14,7 @@ export const TopologyModal = ({
     if (!broadcastId) return;
     setIsLoading(true);
     try {
-      const host = window.location.hostname || 'localhost';
-      const res = await fetch(`http://${host}:10000/api/broadcasts/${broadcastId}/topology`);
+      const res = await fetch(`/api/broadcasts/${broadcastId}/topology`);
       if (res.ok) {
         const data = await res.json();
         setTopology(data);
@@ -47,6 +46,7 @@ export const TopologyModal = ({
   }
 
   const sortedTiers = Array.from(tiersMap.keys()).sort((a, b) => a - b);
+  const maxChildren = topology?.maxChildren ?? 5;
 
   return (
     <div className="fixed inset-0 z-50 bg-[#0A0A0A]/80 backdrop-blur-md flex items-center justify-center p-4">
@@ -102,7 +102,7 @@ export const TopologyModal = ({
             </div>
             <div className="p-4 rounded-2xl border border-[#262630] bg-[#0A0A0A] text-center space-y-1">
               <p className="text-[10px] uppercase text-[#A1A1AA]">Relay Fanout</p>
-              <p className="text-2xl font-display font-bold text-white">5 max</p>
+              <p className="text-2xl font-display font-bold text-white">{maxChildren} max</p>
             </div>
           </div>
 
@@ -156,7 +156,7 @@ export const TopologyModal = ({
                             </div>
 
                             <div className="text-[10px] opacity-75 flex items-center gap-3">
-                              <span>Children: {node.childCount}/5</span>
+                              <span>Children: {node.childCount}/{maxChildren}</span>
                               {node.isMobile && <span>📱 Mobile Leaf</span>}
                             </div>
                           </div>

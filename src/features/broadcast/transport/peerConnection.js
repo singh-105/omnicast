@@ -14,7 +14,19 @@ export const DEFAULT_RTC_CONFIG = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
     { urls: 'stun:global.stun.twilio.com:3478' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
   iceCandidatePoolSize: 2,
 };
@@ -31,18 +43,22 @@ export function getEffectiveRtcConfig(customConfig = null) {
   };
 
   if (typeof import.meta !== 'undefined' && import.meta.env?.VITE_TURN_URL) {
-    baseConfig.iceServers.push({
-      urls: import.meta.env.VITE_TURN_URL,
-      username: import.meta.env.VITE_TURN_USERNAME || '',
-      credential: import.meta.env.VITE_TURN_PASSWORD || '',
-    });
+    const rawUrls = import.meta.env.VITE_TURN_URL;
+    const urls = rawUrls.split(',').map((u) => u.trim()).filter(Boolean);
+    if (urls.length > 0) {
+      baseConfig.iceServers.push({
+        urls,
+        username: import.meta.env.VITE_TURN_USERNAME || '',
+        credential: import.meta.env.VITE_TURN_PASSWORD || '',
+      });
+    }
   }
 
   return baseConfig;
 }
 
 // Backpressure thresholds for RTCDataChannel (128KB low mark, 1MB high mark)
-export const BUFFERED_AMOUNT_LOW_THRESHOLD = 128 * 1024; // 128 KB
+export const BUFFERED_AMOUNT_LOW_THRESHOLD = 256 * 1024; // 256 KB
 export const MAX_BUFFERED_AMOUNT_HIGH = 1024 * 1024;     // 1024 KB (1 MB)
 export const MAX_PENDING_QUEUE_PACKETS = 256;
 
@@ -87,12 +103,17 @@ export class PeerLink {
     this.pendingQueue = [];
     this.pendingQueueBytes = 0;
     this.pendingIceCandidates = [];
+    this._ownerCleanup = false;
+    this._hasSynced = false;
+    this.iceConnectTimer = null;
+    this.selectedCandidateType = 'unknown';
     this.stats = {
       bytesSent: 0,
       bytesReceived: 0,
       packetsSent: 0,
       packetsReceived: 0,
       rttMs: 0,
+      selectedCandidateType: 'unknown',
     };
 
     this.initPeerConnection(getEffectiveRtcConfig(rtcConfig));
@@ -118,7 +139,9 @@ export class PeerLink {
 
     this.pc.onconnectionstatechange = () => {
       this.state = this.pc.connectionState;
-      if (this.onStateChange) this.onStateChange(this.state);
+      if (!this._ownerCleanup && this.onStateChange) {
+        this.onStateChange(this.state);
+      }
 
       if (this.state === 'failed' || this.state === 'closed') {
         this.cleanup();
@@ -156,6 +179,7 @@ export class PeerLink {
     channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
 
     channel.onopen = () => {
+      this.clearIceConnectTimeout();
       this.state = 'open';
       if (this.onStateChange) this.onStateChange('open');
     };
@@ -175,7 +199,9 @@ export class PeerLink {
 
     channel.onclose = () => {
       this.state = 'closed';
-      if (this.onStateChange) this.onStateChange('closed');
+      if (!this._ownerCleanup && this.onStateChange) {
+        this.onStateChange('closed');
+      }
     };
 
     channel.onerror = (err) => {
@@ -270,13 +296,20 @@ export class PeerLink {
     // packet and makes the receiver's reorder queue stall indefinitely.
     if (this.pendingQueue.length > 0 || this.mediaChannel.bufferedAmount > MAX_BUFFERED_AMOUNT_HIGH) {
       this.isBackpressured = true;
-      // Queue whole packets safely without dropping partial fragments during
-      // normal bursts (late-join bootstrap can contain many fragments).
-      if (this.pendingQueue.length < MAX_PENDING_QUEUE_PACKETS) {
-        this.pendingQueue.push(arrayBuffer);
-        this.pendingQueueBytes += arrayBuffer.byteLength;
-      } else {
-        console.warn(`[Transport] Severe backpressure on ${this.remotePeerId.slice(-8)}, queue full (${this.pendingQueue.length} pkts)`);
+      if (this.pendingQueue.length >= MAX_PENDING_QUEUE_PACKETS) {
+        this.dropOldestLogicalChunk();
+      }
+      this.pendingQueue.push(arrayBuffer);
+      this.pendingQueueBytes += arrayBuffer.byteLength;
+
+      // Always attempt to drain if channel has available capacity or schedule immediate drain
+      if (this.mediaChannel.bufferedAmount <= MAX_BUFFERED_AMOUNT_HIGH) {
+        this.flushPendingQueue();
+      } else if (!this._drainTimer) {
+        this._drainTimer = setTimeout(() => {
+          this._drainTimer = null;
+          this.flushPendingQueue();
+        }, 15);
       }
       return false;
     }
@@ -297,6 +330,10 @@ export class PeerLink {
   }
 
   flushPendingQueue() {
+    if (this._drainTimer) {
+      clearTimeout(this._drainTimer);
+      this._drainTimer = null;
+    }
     if (!this.mediaChannel || this.mediaChannel.readyState !== 'open') return;
 
     while (
@@ -306,11 +343,22 @@ export class PeerLink {
       const buf = this.pendingQueue.shift();
       this.pendingQueueBytes -= buf.byteLength;
       if (!this.sendBinaryNow(buf)) {
+        // If sending threw or failed, restore to head of queue
+        this.pendingQueue.unshift(buf);
+        this.pendingQueueBytes += buf.byteLength;
         break;
       }
     }
 
     this.isBackpressured = this.pendingQueue.length > 0 || this.mediaChannel.bufferedAmount > MAX_BUFFERED_AMOUNT_HIGH;
+
+    // Safety fallback: if items remain in queue because buffer is saturated, schedule drain check
+    if (this.pendingQueue.length > 0 && !this._drainTimer) {
+      this._drainTimer = setTimeout(() => {
+        this._drainTimer = null;
+        this.flushPendingQueue();
+      }, 15);
+    }
   }
 
   /**
@@ -330,26 +378,113 @@ export class PeerLink {
     return this.mediaChannel && this.mediaChannel.readyState === 'open';
   }
 
+  dropOldestLogicalChunk() {
+    if (this.pendingQueue.length === 0) return;
+    let targetSeq = null;
+    for (const buf of this.pendingQueue) {
+      if (buf.byteLength >= 11) {
+        const view = new DataView(buf);
+        const type = view.getUint8(5);
+        const flags = view.getUint8(6);
+        const isInit = type === 0x01;
+        const isKeyframe = (flags & 0x01) !== 0;
+        if (!isInit && !isKeyframe) {
+          targetSeq = view.getUint32(7);
+          break;
+        }
+      }
+    }
+
+    if (targetSeq === null && this.pendingQueue[0].byteLength >= 11) {
+      targetSeq = new DataView(this.pendingQueue[0]).getUint32(7);
+    }
+
+    if (targetSeq !== null) {
+      const remaining = [];
+      let droppedBytes = 0;
+      let droppedCount = 0;
+      for (const buf of this.pendingQueue) {
+        let seq = null;
+        if (buf.byteLength >= 11) {
+          seq = new DataView(buf).getUint32(7);
+        }
+        if (seq === targetSeq) {
+          droppedBytes += buf.byteLength;
+          droppedCount++;
+        } else {
+          remaining.push(buf);
+        }
+      }
+      this.pendingQueue = remaining;
+      this.pendingQueueBytes = Math.max(0, this.pendingQueueBytes - droppedBytes);
+      console.warn(`[Transport] Backpressure drop: purged logical chunk seq=${targetSeq} (${droppedCount} frags, ${droppedBytes}B) on ${this.remotePeerId.slice(-8)}`);
+      this._hasSynced = false;
+      if (this.onBackpressureDrop) {
+        this.onBackpressureDrop(targetSeq);
+      }
+    } else {
+      const dropped = this.pendingQueue.shift();
+      this.pendingQueueBytes = Math.max(0, this.pendingQueueBytes - dropped.byteLength);
+      this._hasSynced = false;
+    }
+  }
+
+  startIceConnectTimeout(onTimeout) {
+    this.clearIceConnectTimeout();
+    this.iceConnectTimer = setTimeout(() => {
+      this.iceConnectTimer = null;
+      if (!this.isOpen()) {
+        console.warn(`[Transport] 15s ICE connect timeout reached for ${this.remotePeerId.slice(-8)}`);
+        if (onTimeout) onTimeout();
+      }
+    }, 15000);
+  }
+
+  clearIceConnectTimeout() {
+    if (this.iceConnectTimer) {
+      clearTimeout(this.iceConnectTimer);
+      this.iceConnectTimer = null;
+    }
+  }
+
   async measureStats() {
     if (!this.pc || typeof this.pc.getStats !== 'function') return this.stats;
     try {
       const reports = await this.pc.getStats();
+      let activePair = null;
+      const candidates = new Map();
       reports.forEach((report) => {
-        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+        if (report.type === 'candidate-pair' && (report.state === 'succeeded' || report.nominated)) {
+          activePair = report;
           if (typeof report.currentRoundTripTime === 'number') {
             this.stats.rttMs = Math.round(report.currentRoundTripTime * 1000);
           }
+        } else if (report.type === 'local-candidate' || report.type === 'remote-candidate') {
+          candidates.set(report.id, report);
         }
       });
+      if (activePair) {
+        const local = candidates.get(activePair.localCandidateId);
+        const remote = candidates.get(activePair.remoteCandidateId);
+        if (local && remote) {
+          this.selectedCandidateType = `${local.candidateType} -> ${remote.candidateType}`;
+          this.stats.selectedCandidateType = this.selectedCandidateType;
+        }
+      }
     } catch (_) {}
     return this.stats;
   }
 
   cleanup() {
-    // Detach all callbacks first so tear-down does not trigger false disconnect loops
-    this.onStateChange = null;
+    this._ownerCleanup = true;
+    if (this._drainTimer) {
+      clearTimeout(this._drainTimer);
+      this._drainTimer = null;
+    }
+    this.clearIceConnectTimeout();
     this.onBinaryMessage = null;
     this.onControlMessage = null;
+    this.onStateChange = null;
 
     if (this.mediaChannel) {
       try {
