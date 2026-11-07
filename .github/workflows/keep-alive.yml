@@ -1,0 +1,17 @@
+
+name: OmniCast Keep Alive
+
+on:
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping OmniCast Server
+        run: |
+          curl --fail --silent --show-error \
+            --max-time 30 --retry 2 \
+            https://omnicast-g244.onrender.com/health
